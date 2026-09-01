@@ -60,87 +60,117 @@ DEFAULTS = {
     "terminal": ["alacritty", "foot", "ghostty", "kitty"],
 }
 
-ACCENT = "#4A7BB5"
-STEEL = "#8A9096"
-FG = "#F2F3F5"
-
-CSS = """
-Screen { background: #07090C; }
-
-#brand { height: 3; background: #0E141C; padding: 0 3; layout: horizontal; }
-#brand-title { width: 1fr; content-align: left middle; color: #4A7BB5; text-style: bold; }
-#brand-meta { width: auto; content-align: right middle; color: #8A9096; }
-
-#body { layout: horizontal; height: 1fr; }
-#sidebar { width: 30; height: 1fr; border-right: solid #1A406A; background: #0D1117; }
-#sidebar OptionList { padding: 1; }
-#view-switcher { width: 1fr; height: 1fr; }
-
-#sidebar OptionList > .option-list--option--highlight {
-    background: #1A406A;
-    color: #F2F3F5;
-    text-style: bold;
+_HOLMES = {
+    "background": "#07090C",
+    "dark_background": "#05070A",
+    "darker_background": "#030406",
+    "lighter_background": "#0E141C",
+    "foreground": "#E6E8EA",
+    "dark_foreground": "#8A9096",
+    "light_foreground": "#F2F3F5",
+    "bright_foreground": "#F7F8F9",
+    "accent": "#4A7BB5",
+    "selection": "#152033",
+    "muted": "#676B6E",
+    "active_tab_background": "#1A406A",
 }
 
-Label { color: #B9C0C7; }
-Label.section-title { color: #4A7BB5; text-style: bold; padding: 1 1 0 1; }
-Label.kind-label { padding: 0 1; width: 12; }
 
-Static.hint { color: #8A9096; padding: 0 1; }
-Static.stat { padding: 0 1; }
-Static.theme-details { padding: 0 1; width: 1fr; }
-Static.swatch-text { padding: 1; }
+def build_palette() -> dict[str, str]:
+    colors = {}
+    for t in theme_dirs():
+        if theme_names_match(active_theme(), t["name"]):
+            colors = theme_colors(t["dir"])
+            break
+    palette = dict(_HOLMES)
+    for key in _HOLMES:
+        val = colors.get(key)
+        if isinstance(val, str) and val.startswith("#"):
+            palette[key] = val
+    return palette
 
-Horizontal.pads { padding: 1; }
-Horizontal.buttons-row { height: auto; padding: 0 1; }
-Vertical.col { height: 1fr; }
 
-OptionList { background: #0D1117; border: round #152033; height: 1fr; }
-#hook-list { height: 48; max-height: 60%; }
-OptionList:focus { border: round #4A7BB5; }
-OptionList > .option-list--option--highlight { background: #1A406A; color: #F2F3F5; }
+def app_css(p: dict[str, str]) -> str:
+    def fgon(hexcol: str) -> str:
+        return p["darker_background"] if luminance(hexcol) > 0.5 else p["light_foreground"]
 
-DataTable {
-    background: #0D1117;
-    border: round #152033;
+    return f"""
+Screen {{ background: {p["background"]}; }}
+
+#brand {{ height: 3; background: {p["lighter_background"]}; padding: 0 3; layout: horizontal; }}
+#brand-title {{ width: 1fr; content-align: left middle; color: {p["accent"]}; text-style: bold; }}
+#brand-meta {{ width: auto; content-align: right middle; color: {p["dark_foreground"]}; }}
+
+#body {{ layout: horizontal; height: 1fr; }}
+#sidebar {{ width: 30; height: 1fr; border-right: solid {p["active_tab_background"]}; background: {p["dark_background"]}; }}
+#sidebar OptionList {{ padding: 1; }}
+#view-switcher {{ width: 1fr; height: 1fr; }}
+
+#sidebar OptionList > .option-list--option--highlight {{
+    background: {p["active_tab_background"]};
+    color: {fgon(p["active_tab_background"])};
+    text-style: bold;
+}}
+
+Label {{ color: {p["foreground"]}; }}
+Label.section-title {{ color: {p["accent"]}; text-style: bold; padding: 1 1 0 1; }}
+Label.kind-label {{ padding: 0 1; width: 12; }}
+
+Static.hint {{ color: {p["dark_foreground"]}; padding: 0 1; }}
+Static.stat {{ padding: 0 1; }}
+Static.theme-details {{ padding: 0 1; width: 1fr; }}
+Static.swatch-text {{ padding: 1; }}
+
+Horizontal.pads {{ padding: 1; }}
+Horizontal.buttons-row {{ height: auto; padding: 0 1; }}
+Vertical.col {{ height: 1fr; }}
+
+OptionList {{ background: {p["dark_background"]}; border: round {p["selection"]}; height: 1fr; }}
+#hook-list {{ height: 48; max-height: 60%; }}
+OptionList:focus {{ border: round {p["accent"]}; }}
+OptionList > .option-list--option--highlight {{ background: {p["active_tab_background"]}; color: {fgon(p["active_tab_background"])}; }}
+
+DataTable {{
+    background: {p["dark_background"]};
+    border: round {p["selection"]};
     height: 1fr;
-}
-DataTable > .datatable--header { background: #0E141C; color: #4A7BB5; text-style: bold; }
-DataTable > .datatable--cursor { background: #1A406A; color: #F2F3F5; }
-DataTable > .datatable--fixed { color: #4A7BB5; }
+}}
+DataTable > .datatable--header {{ background: {p["lighter_background"]}; color: {p["accent"]}; text-style: bold; }}
+DataTable > .datatable--cursor {{ background: {p["active_tab_background"]}; color: {fgon(p["active_tab_background"])}; }}
+DataTable > .datatable--fixed {{ color: {p["accent"]}; }}
 
-Input { border: round #152033; background: #0D1117; }
-Input:focus { border: round #4A7BB5; }
-Input.search { width: 1fr; margin: 0 1; }
+Input {{ border: round {p["selection"]}; background: {p["dark_background"]}; }}
+Input:focus {{ border: round {p["accent"]}; }}
+Input.search {{ width: 1fr; margin: 0 1; }}
 
-Select { border: round #152033; background: #0D1117; }
-Select:focus { border: round #4A7BB5; }
+Select {{ border: round {p["selection"]}; background: {p["dark_background"]}; }}
+Select:focus {{ border: round {p["accent"]}; }}
 
-Button { background: #1A406A; color: #F2F3F5; border: none; min-width: 8; }
-Button:hover { background: #4A7BB5; color: #030406; }
-Button.primary { background: #4A7BB5; color: #030406; text-style: bold; }
+Button {{ background: {p["active_tab_background"]}; color: {fgon(p["active_tab_background"])}; border: none; min-width: 8; }}
+Button:hover {{ background: {p["accent"]}; color: {fgon(p["accent"])}; }}
+Button.primary {{ background: {p["accent"]}; color: {fgon(p["accent"])}; text-style: bold; }}
 
-TabbedContent { height: 1fr; }
-TabbedContent > .tabbed-content--tab-label {
-    color: #8A9096;
+TabbedContent {{ height: 1fr; }}
+TabbedContent > .tabbed-content--tab-label {{
+    color: {p["dark_foreground"]};
     padding: 0 2;
-}
-TabbedContent > .tabbed-content--tab-label.--active {
-    color: #F2F3F5;
+}}
+TabbedContent > .tabbed-content--tab-label.--active {{
+    color: {p["light_foreground"]};
     text-style: bold;
-}
-TabPane { height: 1fr; }
+}}
+TabPane {{ height: 1fr; }}
 
-#kb-note { padding: 0 1; }
+#kb-note {{ padding: 0 1; }}
 
-.term-block, .plugin-block, .hook-block { width: 1fr; height: 1fr; }
+.term-block, .plugin-block, .hook-block {{ width: 1fr; height: 1fr; }}
 
-.defaults-row, .settings-row { height: 3; padding: 0 1; }
-.defaults-row Input, .settings-row Input, .settings-row Select, .settings-row Switch { width: 1fr; }
-.defaults-row Button, .settings-row Button { width: 12; }
-.settings-row Switch { background: #152033; }
+.defaults-row, .settings-row {{ height: 3; padding: 0 1; }}
+.defaults-row Input, .settings-row Input, .settings-row Select, .settings-row Switch {{ width: 1fr; }}
+.defaults-row Button, .settings-row Button {{ width: 12; }}
+.settings-row Switch {{ background: {p["selection"]}; }}
 
-Footer { color: #B9C0C7; background: #0D1117; }
+Footer {{ color: {p["foreground"]}; background: {p["lighter_background"]}; }}
 """
 
 
@@ -241,6 +271,13 @@ def active_theme() -> str:
 
 def theme_names_match(a: str, b: str) -> bool:
     return a.strip().lower().replace(" ", "-") == b.strip().lower()
+
+
+PALETTE = build_palette()
+ACCENT = PALETTE["accent"]
+STEEL = PALETTE["dark_foreground"]
+FG = PALETTE["light_foreground"]
+APP_CSS = app_css(PALETTE)
 
 
 def plugin_entries() -> list[dict]:
@@ -1201,7 +1238,7 @@ class DefaultsView(VerticalScroll):
 
 class OmarchyCommandCenter(App):
     TITLE = "Omarchy Command Center"
-    CSS = CSS
+    CSS = APP_CSS
     BINDINGS = [
         Binding("f1", "goto_dashboard", "Dashboard", show=True),
         Binding("f2", "goto_themes", "Themes", show=True),

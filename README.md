@@ -13,6 +13,9 @@ required.
 - **Dashboard** — at-a-glance view of your Omarchy installation: version,
   active theme, bar position/transparency, idle timers, defaults,
   installed/enabled plugins, hooks, and a commands health check.
+- **Theme-aware UI** — the interface palette is built from your active
+  Omarchy theme's `colors.toml`, so it follows light and dark themes
+  automatically; no manual theming needed.
 - **Themes** — browse user and built-in themes, preview each one's core
   colors and ANSI palette live from its `colors.toml`, apply with a
   single key (`omarchy theme set`).
