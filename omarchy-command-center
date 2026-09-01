@@ -120,7 +120,9 @@ Label.kind-label {{ padding: 0 1; width: 12; }}
 Static.hint {{ color: {p["dark_foreground"]}; padding: 0 1; }}
 Static.stat {{ padding: 0 1; }}
 Static.theme-details {{ padding: 0 1; width: 1fr; }}
-Static.swatch-text {{ padding: 1; }}
+.swatch-box {{ height: auto; padding: 0 1; }}
+.swatch-row {{ height: 1; width: 100%; }}
+Static.swatch {{ width: 1fr; height: 1; padding: 0 1; }}
 
 Horizontal.pads {{ padding: 1; }}
 Horizontal.buttons-row {{ height: auto; padding: 0 1; }}
@@ -244,9 +246,12 @@ def luminance(hexcol: str) -> float:
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-def swatch(name: str, hexcol: str) -> str:
+def swatch(name: str, hexcol: str) -> Static:
     fg = "#000000" if luminance(hexcol) > 0.5 else "#ffffff"
-    return f"[{fg} on {hexcol}] {name:<12} {hexcol} [/]"
+    chip = Static(f"{name} {hexcol}", markup=False, classes="swatch")
+    chip.styles.background = hexcol
+    chip.styles.color = fg
+    return chip
 
 
 def shell_data() -> dict:
@@ -272,11 +277,11 @@ def theme_dirs() -> list[dict]:
 
 
 def theme_colors(tdir: Path) -> dict:
-    hits = [f for f in tdir.rglob("colors.toml") if f.is_file()]
-    if not hits:
+    path = tdir / "colors.toml"
+    if not path.is_file():
         return {}
     try:
-        with hits[0].open("rb") as fh:
+        with path.open("rb") as fh:
             return tomllib.load(fh)
     except Exception:
         return {}
@@ -642,8 +647,8 @@ class ThemesView(Vertical):
                 yield Label("Preview", classes="section-title")
                 yield Static("", id="theme-name", classes="stat")
                 yield Static("", id="theme-path", classes="hint")
-                yield Static("", id="theme-core", classes="swatch-text")
-                yield Static("", id="theme-palette", classes="swatch-text")
+                yield Vertical(id="theme-core", classes="swatch-box")
+                yield Vertical(id="theme-palette", classes="swatch-box")
                 yield Horizontal(
                     Button("Apply theme", id="theme-apply", variant="primary"),
                     Button("Refresh", id="theme-refresh"),
@@ -710,34 +715,40 @@ class ThemesView(Vertical):
         self.query_one("#theme-name", Static).update(f"[b {ACCENT}]{name}[/]  [i]{origin}[/]")
         self.query_one("#theme-path", Static).update(f"{t['dir']}")
         colors = theme_colors(t["dir"])
-        if not colors:
-            self.query_one("#theme-core", Static).update(f"[{STEEL}]no colors.toml palette[/]")
-            self.query_one("#theme-palette", Static).update("")
-            return
-        core = []
-        for key in ("background", "foreground", "accent", "selection", "active_border_color"):
-            if colors.get(key):
-                core.append(swatch(key[:3] + ":" if key == "active_border_color" else key[:3], colors[key]))
-        self.query_one("#theme-core", Static).update("\n".join(self._chunk(core)))
-        p = []
-        for key in ("red", "green", "yellow", "blue", "magenta", "cyan", "orange", "brown"):
-            if colors.get(key):
-                p.append(swatch(key, colors[key]))
-        for key in (
+        core_keys = ("background", "foreground", "accent", "selection", "active_border_color")
+        pal_keys = (
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "orange",
+            "brown",
             "bright_red",
             "bright_green",
             "bright_yellow",
             "bright_blue",
             "bright_magenta",
             "bright_cyan",
-        ):
-            if colors.get(key):
-                p.append(swatch(key.replace("bright_", "b-")[:12], colors[key]))
-        self.query_one("#theme-palette", Static).update("\n".join(self._chunk(p)))
+        )
+        if not colors:
+            self._fill_swatches("#theme-core", [])
+            self.query_one("#theme-core").mount(Static(f"[{STEEL}]no colors.toml palette[/]", classes="hint"))
+            self._fill_swatches("#theme-palette", [])
+            return
+        self._fill_swatches("#theme-core", [(k, colors[k]) for k in core_keys if colors.get(k)])
+        self._fill_swatches("#theme-palette", [(k, colors[k]) for k in pal_keys if colors.get(k)])
 
-    @staticmethod
-    def _chunk(items: list[str], width: int = 4) -> list[str]:
-        return ["".join(items[i : i + width]) for i in range(0, len(items), width)]
+    def _fill_swatches(self, widget_id: str, items: list[tuple[str, object]]) -> None:
+        box = self.query_one(widget_id)
+        box.remove_children()
+        chips = []
+        for name, val in items:
+            if isinstance(val, str) and val.startswith("#"):
+                chips.append(swatch(name, val))
+        for i in range(0, len(chips), 2):
+            box.mount(Horizontal(*chips[i : i + 2], classes="swatch-row"))
 
 
 class BarView(VerticalScroll):
