@@ -16,10 +16,11 @@ import tomllib
 from pathlib import Path
 from typing import Optional
 
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -171,6 +172,18 @@ TabPane {{ height: 1fr; }}
 .settings-row Switch {{ background: {p["selection"]}; }}
 
 Footer {{ color: {p["foreground"]}; background: {p["lighter_background"]}; }}
+
+RebindScreen {{ align: center middle; }}
+#rebind-dialog {{
+    width: 74;
+    height: auto;
+    padding: 1 2;
+    border: thick {p["accent"]};
+    background: {p["dark_background"]};
+}}
+#rebind-dialog Input {{ width: 1fr; margin: 0 0 1 0; }}
+#rebind-dialog Label.kind-label {{ padding: 0; }}
+#rebind-dialog .buttons-row {{ padding: 0; }}
 """
 
 
@@ -356,6 +369,65 @@ def build_hypr_rows() -> tuple[tuple[str, str], list, set, bool]:
         else:
             marked.append(row)
     return ("Key Binding", "Description"), marked, overrides, defaults_off
+
+
+def _hbind_key(line: str) -> Optional[str]:
+    m = re.search(r"\b(?:o\.bind|hl\.unbind)\(\s*\"([^\"]+)\"", line)
+    return m.group(1) if m else None
+
+
+def hypr_overrides_map() -> dict[str, tuple[str, str]]:
+    overrides = {}
+    if not HYPR_BINDINGS.is_file():
+        return overrides
+    for line in HYPR_BINDINGS.read_text().splitlines():
+        m = re.search(
+            r'o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"((?:[^"\\]|\\.)*)")\s*,\s*"((?:[^"\\]|\\.)*)"',
+            line,
+        )
+        if m:
+            overrides[m.group(1)] = (_unlua_str(m.group(2) or ""), _unlua_str(m.group(3)))
+    return overrides
+
+
+def _unlua_str(s: str) -> str:
+    return s.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _lua_str(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _write_hypr_bindings(body: str) -> None:
+    backup(HYPR_BINDINGS)
+    HYPR_BINDINGS.write_text(body.rstrip() + "\n")
+
+
+def hypr_write_change(old_key: str, new_key: str, description: str, command: str, default_keys: set) -> None:
+    text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
+    lines = [ln for ln in text.splitlines() if _hbind_key(ln) not in (old_key, new_key)]
+    kept = "\n".join(lines).rstrip()
+    additions = []
+    if new_key in default_keys:
+        additions.append(f'hl.unbind("{new_key}")')
+    desc = f'"{_lua_str(description)}"' if description else "nil"
+    additions.append(f'o.bind("{new_key}", {desc}, "{_lua_str(command)}")')
+    body = kept + "\n" + "\n".join(additions) if kept else "\n".join(additions)
+    _write_hypr_bindings(body)
+
+
+def hypr_write_unbind(key: str) -> None:
+    text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
+    lines = [ln for ln in text.splitlines() if _hbind_key(ln) != key]
+    kept = "\n".join(lines).rstrip()
+    body = kept + "\n" + f'hl.unbind("{key}")' if kept else f'hl.unbind("{key}")'
+    _write_hypr_bindings(body)
+
+
+def hypr_write_revert(key: str) -> None:
+    text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
+    lines = [ln for ln in text.splitlines() if _hbind_key(ln) != key]
+    _write_hypr_bindings("\n".join(lines).rstrip())
 
 
 def re_search(pattern: str, text: str) -> Optional[str]:
@@ -851,6 +923,62 @@ class BarView(VerticalScroll):
                     break
 
 
+class KbDataTable(DataTable):
+    BINDINGS = [Binding("enter", "edit", "Edit binding")]
+
+    async def action_edit(self) -> None:
+        if self.cursor_row is not None:
+            self.app.query_one(KeybindingsView).edit_selected()
+
+
+class RebindScreen(ModalScreen[dict]):
+    def __init__(self, key: str, description: str, command: str):
+        super().__init__()
+        self.key = key
+        self.description = description
+        self.command = command
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rebind-dialog"):
+            yield Label("Keybinding override", classes="section-title")
+            yield Label("Key", classes="kind-label")
+            yield Input(id="rb-key", value=self.key, placeholder="e.g. SUPER + TAB")
+            yield Label("Description", classes="kind-label")
+            yield Input(id="rb-desc", value=self.description, placeholder="What it does")
+            yield Label("Command", classes="kind-label")
+            yield Input(id="rb-cmd", value=self.command, placeholder="e.g. omarchy-menu toggle root")
+            yield Horizontal(
+                Button("Save", id="rb-save", variant="primary"),
+                Button("Unbind", id="rb-unbind"),
+                Button("Restore default", id="rb-revert"),
+                Button("Cancel", id="rb-cancel"),
+                classes="buttons-row",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#rb-key", Input).focus()
+
+    @on(Button.Pressed)
+    def _button(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "rb-save":
+            key = self.query_one("#rb-key", Input).value.strip()
+            desc = self.query_one("#rb-desc", Input).value.strip()
+            cmd = self.query_one("#rb-cmd", Input).value.strip()
+            if not key:
+                self.notify("Key is required", severity="warning")
+                return
+            if not cmd:
+                self.notify("Command is required", severity="warning")
+                return
+            self.dismiss({"action": "save", "key": key, "description": desc, "command": cmd})
+        elif ev.button.id == "rb-unbind":
+            self.dismiss({"action": "unbind"})
+        elif ev.button.id == "rb-revert":
+            self.dismiss({"action": "revert"})
+        elif ev.button.id == "rb-cancel":
+            self.dismiss({"action": "cancel"})
+
+
 class KeybindingsView(Vertical):
     TABS = (
         ("hypr", "Hyprland", ("Key Binding", "Description")),
@@ -870,6 +998,9 @@ class KeybindingsView(Vertical):
         self.rows: dict[str, list] = {}
         self.hypr_overrides: set = set()
         self.hypr_defaults_off = False
+        self.hypr_default_keys: set = set()
+        self.hypr_override_map: dict[str, tuple[str, str]] = {}
+        self._hypr_display: list = []
 
     def compose(self) -> ComposeResult:
         with TabbedContent():
@@ -878,7 +1009,16 @@ class KeybindingsView(Vertical):
                     yield Static(self.NOTES[tab], id=f"kb-note-{tab}", classes="hint")
                     yield Input(id=f"kb-search-{tab}", classes="search", placeholder="Search…")
                     yield Static("", id=f"kb-info-{tab}", classes="hint")
-                    yield DataTable(id=f"kb-table-{tab}", cursor_type="row")
+                    if tab == "hypr":
+                        yield KbDataTable(id=f"kb-table-{tab}", cursor_type="row")
+                        yield Horizontal(
+                            Button("Edit…", id="kb-edit", variant="primary"),
+                            Button("Unbind", id="kb-unbind"),
+                            Button("Refresh", id="kb-refresh"),
+                            classes="buttons-row",
+                        )
+                    else:
+                        yield DataTable(id=f"kb-table-{tab}", cursor_type="row")
 
     def on_mount(self) -> None:
         self.refresh_view()
@@ -889,10 +1029,64 @@ class KeybindingsView(Vertical):
         self.rows["tmux"] = build_tmux_rows()
         self.rows["herdr"] = build_herdr_rows()
         self.rows["nvim"] = build_nvim_rows()
+        self.hypr_overrides = overrides
+        self.hypr_defaults_off = defaults_off
+        self.hypr_default_keys = {r[0] for r in rows}
+        self.hypr_override_map = hypr_overrides_map()
         for tab, _label, cols_def in self.TABS:
             self.render_table(tab, cols_def)
         if defaults_off:
             self.notify("Hyprland default bindings are all disabled (bindings.lua flag)", timeout=3)
+
+    @on(Button.Pressed, "#kb-edit")
+    def _edit(self) -> None:
+        self.edit_selected()
+
+    @on(Button.Pressed, "#kb-unbind")
+    async def _unbind(self) -> None:
+        key = self._selected_key()
+        if not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        hypr_write_unbind(key)
+        self.notify(f"Unbound {key}")
+        self.refresh_view()
+
+    @on(Button.Pressed, "#kb-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @work
+    async def edit_selected(self) -> None:
+        key = self._selected_key()
+        if not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        desc, cmd = self.hypr_override_map.get(key, ("", ""))
+        if not desc and self._hypr_display:
+            table = self.query_one("#kb-table-hypr", DataTable)
+            if 0 <= table.cursor_row < len(self._hypr_display):
+                desc = self._hypr_display[table.cursor_row][1].split("  [user override]")[0]
+        result = await self.app.push_screen_wait(RebindScreen(key, desc, cmd))
+        if not result or result["action"] == "cancel":
+            return
+        if result["action"] == "unbind":
+            hypr_write_unbind(key)
+            self.notify(f"Unbound {key}")
+        elif result["action"] == "revert":
+            hypr_write_revert(key)
+            self.notify(f"Restored default for {key}")
+        else:
+            hypr_write_change(key, result["key"], result["description"], result["command"], self.hypr_default_keys)
+            verb = "Changed" if result["key"] == key else "Rebound"
+            self.notify(f"{verb} {result['key']} → {result['command']}")
+        self.refresh_view()
+
+    def _selected_key(self) -> Optional[str]:
+        table = self.query_one("#kb-table-hypr", DataTable)
+        if table.cursor_row is None or not (0 <= table.cursor_row < len(self._hypr_display)):
+            return None
+        return str(self._hypr_display[table.cursor_row][0])
 
     @on(Input.Changed)
     def _search(self, ev: Input.Changed) -> None:
@@ -911,6 +1105,8 @@ class KeybindingsView(Vertical):
         filtered = [r for r in rows if not query or any(query in str(c).lower() for c in r)]
         if filtered:
             table.add_rows(filtered)
+        if tab == "hypr":
+            self._hypr_display = filtered
         self.query_one(f"#kb-info-{tab}", Static).update(f"{len(filtered)} of {len(rows)} rows")
 
 

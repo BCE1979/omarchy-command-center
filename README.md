@@ -25,7 +25,10 @@ required.
   timestamped backup before each write.
 - **Keybindings** — four tabs (Hyprland, Tmux, Herdr, Neovim) with live
   search. Hyprland rows are parsed from `omarchy menu keybindings
-  --print` and your `bindings.lua` overrides are flagged inline.
+  --print` and your `bindings.lua` overrides are flagged inline. Edit,
+  unbind, or restore a selected Hyprland binding via override lines
+  written to `~/.config/hypr/bindings.lua` (timestamped backup before
+  each write).
 - **Terminals** — detect installed terminal emulators, inspect each
   config (with its theme `include`/`import` line), set the default.
 - **Plugins** — list installed plugins with their manifest metadata and
@@ -46,7 +49,7 @@ required.
 
 ```sh
 # clone
-git clone https://github.com/tjholmesphd-hash/omarchy-command-center.git
+git clone https://github.com/BCE1979/omarchy-command-center.git
 cd omarchy-command-center
 
 # 1. install the only dependency
@@ -87,7 +90,7 @@ omarchy-command-center
 | 1 | Dashboard | status overview, plugin/hook counts |
 | 2 | Themes | browse + apply themes |
 | 3 | Bar | layout, position, idle timers |
-| 4 | Keybindings | Hyprland / Tmux / Herdr / Neovim |
+| 4 | Keybindings | Hyprland / Tmux / Herdr / Neovim; Enter or Edit… on a Hyprland row |
 | 5 | Terminals | detection, configs, default |
 | 6 | Plugins | enable/disable, register |
 | 7 | Hooks | lifecycle hooks on/off |
