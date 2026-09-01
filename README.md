@@ -43,7 +43,7 @@ required.
 
 ```sh
 # clone
-git clone https://github.com/YOUR-USER/omarchy-command-center.git
+git clone https://github.com/tjholmesphd-hash/omarchy-command-center.git
 cd omarchy-command-center
 
 # 1. install the only dependency
