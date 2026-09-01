@@ -208,12 +208,22 @@ def read_json(path: Path) -> dict:
 
 
 def write_json(path: Path, data: dict, backup: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if backup and path.exists():
         bak = path.with_name(f"{path.name}.bak.{int(time.time())}")
         try:
             shutil.copy2(path, bak)
         except Exception:
             pass
+        baks = sorted(
+            path.parent.glob(f"{path.name}.bak.*"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        )
+        for extra in baks[:-5]:
+            try:
+                extra.unlink()
+            except Exception:
+                pass
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
@@ -247,16 +257,11 @@ def theme_dirs() -> list[dict]:
     result: list[dict] = []
     seen: set[str] = set()
 
-    def is_theme(d: Path) -> bool:
-        if not d.is_dir():
-            return False
-        return (d / "colors.toml").exists() or any(f.name == "colors.toml" for f in d.rglob("*"))
-
     for base, user in ((CONFIG_DIR / "themes", True), (Path("/usr/share/omarchy/themes"), False)):
         if not base.is_dir():
             continue
         for d in sorted(base.iterdir()):
-            if d.name.startswith(".") or not is_theme(d):
+            if d.name.startswith(".") or not d.is_dir() or not (d / "colors.toml").is_file():
                 continue
             name = d.name
             if name in seen:
@@ -286,11 +291,17 @@ def theme_names_match(a: str, b: str) -> bool:
     return a.strip().lower().replace(" ", "-") == b.strip().lower()
 
 
-PALETTE = build_palette()
+PALETTE = dict(_HOLMES)
 ACCENT = PALETTE["accent"]
 STEEL = PALETTE["dark_foreground"]
 FG = PALETTE["light_foreground"]
-APP_CSS = app_css(PALETTE)
+
+
+def slug(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9-]+", "-", str(name)).strip("-")
+    if not s or s[0].isdigit():
+        s = f"x-{s}" if s else "x"
+    return s
 
 
 def plugin_entries() -> list[dict]:
@@ -372,7 +383,10 @@ def build_hypr_rows() -> tuple[tuple[str, str], list, set, bool]:
 
 
 def _hbind_key(line: str) -> Optional[str]:
-    m = re.search(r"\b(?:o\.bind|hl\.unbind)\(\s*\"([^\"]+)\"", line)
+    s = line.strip()
+    if not s or s.startswith("--"):
+        return None
+    m = re.search(r"\b(?:o\.bind|hl\.unbind)\(\s*\"([^\"]+)\"", s)
     return m.group(1) if m else None
 
 
@@ -405,7 +419,12 @@ def _write_hypr_bindings(body: str) -> None:
 
 def hypr_write_change(old_key: str, new_key: str, description: str, command: str, default_keys: set) -> None:
     text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
-    lines = [ln for ln in text.splitlines() if _hbind_key(ln) not in (old_key, new_key)]
+    lines = []
+    for ln in text.splitlines():
+        key = _hbind_key(ln)
+        if key is not None and key in (old_key, new_key):
+            continue
+        lines.append(ln)
     kept = "\n".join(lines).rstrip()
     additions = []
     if new_key in default_keys:
@@ -418,7 +437,12 @@ def hypr_write_change(old_key: str, new_key: str, description: str, command: str
 
 def hypr_write_unbind(key: str) -> None:
     text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
-    lines = [ln for ln in text.splitlines() if _hbind_key(ln) != key]
+    lines = []
+    for ln in text.splitlines():
+        matched = _hbind_key(ln)
+        if matched is not None and matched == key:
+            continue
+        lines.append(ln)
     kept = "\n".join(lines).rstrip()
     body = kept + "\n" + f'hl.unbind("{key}")' if kept else f'hl.unbind("{key}")'
     _write_hypr_bindings(body)
@@ -426,7 +450,12 @@ def hypr_write_unbind(key: str) -> None:
 
 def hypr_write_revert(key: str) -> None:
     text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
-    lines = [ln for ln in text.splitlines() if _hbind_key(ln) != key]
+    lines = []
+    for ln in text.splitlines():
+        matched = _hbind_key(ln)
+        if matched is not None and matched == key:
+            continue
+        lines.append(ln)
     _write_hypr_bindings("\n".join(lines).rstrip())
 
 
@@ -529,11 +558,10 @@ class DashboardView(VerticalScroll):
         version = sh(["omarchy", "version"]) or "unknown"
         theme = active_theme() or "unknown"
         bg = sh(["omarchy", "theme", "bg", "current"]) or "–"
-        check = sh(["omarchy", "commands", "--check"]) or "unavailable"
-        lc = check.lower()
-        if not check and check == "unavailable":
+        check = sh(["omarchy", "commands", "--check"])
+        if not check:
             check_status = "unavailable"
-        elif "failed" in lc:
+        elif "failed" in check.lower():
             check_status = check.splitlines()[0].strip()[:30]
         else:
             check_status = "OK"
@@ -573,16 +601,16 @@ class DashboardView(VerticalScroll):
             ("Hooks", hook_summary),
             ("Commands check", check_status),
         ]
-        lines = ["[b #4A7BB5]OMARCHY SYSTEM[/]", ""]
+        lines = [f"[b {PALETTE['accent']}]OMARCHY SYSTEM[/]", ""]
         for label, value in commands:
-            lines.append(f"[b #8A9096]{label:<24}[/] {value}")
+            lines.append(f"[b {PALETTE['muted']}]{label:<24}[/] {value}")
         self.query_one("#dash-stats", Static).update("\n".join(lines))
 
         plist = self.query_one("#dash-plugins", OptionList)
         plist.clear_options()
         plist.add_options(
             [
-                Option(("● " if plugin_enabled(p["id"]) else "○ ") + p["id"], id=f"dp-{p['id']}")
+                Option(("● " if plugin_enabled(p["id"]) else "○ ") + p["id"], id=f"dp-{slug(p['id'])}")
                 for p in plugins
             ]
         )
@@ -592,7 +620,7 @@ class DashboardView(VerticalScroll):
             [
                 Option(
                     ("● " if h["active"] else "○ ") + f"{h['event']}/{h['name']}",
-                    id=f"dh-{h['event']}-{h['name']}",
+                    id=f"dh-{slug(h['event'])}-{slug(h['name'])}",
                 )
                 for h in hooks
             ]
@@ -641,6 +669,7 @@ class ThemesView(Vertical):
         out, err, code = run(["omarchy", "theme", "set", name])
         if code == 0:
             self.notify(f"Theme applied: {name}")
+            self.app._apply_theme_css()
         else:
             self.notify(f"Failed to apply theme: {err.strip() or out.strip()}", severity="error")
         self.refresh_view()
@@ -655,15 +684,22 @@ class ThemesView(Vertical):
         ol = self.query_one("#theme-list", OptionList)
         ol.clear_options()
         opts = []
-        for t in self.themes:
+        active_idx = 0
+        for i, t in enumerate(self.themes):
             marker = "● " if theme_names_match(self.current, t["name"]) else "○ "
             label = marker + t["name"]
             if not t["user"]:
                 label += "  (built-in)"
-            opts.append(Option(label, id=f"th-{t['name']}"))
+            opts.append(Option(label, id=f"th-{slug(t['name'])}"))
+            if theme_names_match(self.current, t["name"]):
+                active_idx = i
         ol.add_options(opts)
         if self.themes:
-            self._preview(0)
+            try:
+                ol.highlighted = active_idx
+            except Exception:
+                pass
+            self._preview(active_idx)
 
     def _preview(self, idx: int) -> None:
         if idx is None or not self.themes or not (0 <= idx < len(self.themes)):
@@ -787,7 +823,7 @@ class BarView(VerticalScroll):
             return
         removed = self.sections[sec].pop(hl)
         self._rerender(hl, sec)
-        self.notify(f"Removed {removed}")
+        self.notify(f"Removed {removed.get('id', removed) if isinstance(removed, dict) else removed}")
 
     @on(Button.Pressed, "#btn-add")
     def _add_custom(self) -> None:
@@ -797,7 +833,7 @@ class BarView(VerticalScroll):
             self.notify("Enter a widget id first", severity="warning")
             return
         sec = self._cur_section()
-        self.sections[sec].append(wid)
+        self.sections[sec].append({"id": wid})
         inp.value = ""
         self._rerender(len(self.sections[sec]) - 1, sec)
         self.notify(f"Added {wid} to {sec}")
@@ -807,7 +843,19 @@ class BarView(VerticalScroll):
         self._read_settings_inputs()
         data = shell_data()
         bar = data.setdefault("bar", {})
-        bar["layout"] = {k: [{"id": i} for i in v] for k, v in self.sections.items()}
+        layout = {}
+        for k, widgets in self.sections.items():
+            items = []
+            for w in widgets:
+                if isinstance(w, dict):
+                    item = dict(w)
+                    if "id" not in item:
+                        item["id"] = str(w)
+                    items.append(item)
+                else:
+                    items.append({"id": str(w)})
+            layout[k] = items
+        bar["layout"] = layout
         bar["position"] = self.position
         bar["transparent"] = self.transparent
         bar["centerAnchor"] = self.anchor
@@ -815,8 +863,17 @@ class BarView(VerticalScroll):
         data["idle"]["lock"] = int(self.lock or 0)
         data["idle"]["screensaver"] = int(self.ssaver or 0)
         write_json(SHELL_JSON, data, backup=True)
-        run(["omarchy", "bar", "position", self.position])
-        run(["omarchy", "bar", "transparent", "true" if self.transparent else "false"])
+        errors = []
+        for cmd in (
+            ["omarchy", "bar", "position", self.position],
+            ["omarchy", "bar", "transparent", "true" if self.transparent else "false"],
+        ):
+            out, err, code = run(cmd)
+            if code != 0:
+                errors.append((err or out).strip() or " ".join(cmd))
+        if errors:
+            self.notify(errors[0], severity="error")
+            return
         self.notify("Bar config saved and applied")
 
     def load(self) -> None:
@@ -826,7 +883,7 @@ class BarView(VerticalScroll):
         for sec in self.sections:
             entries = layout.get(sec) or []
             self.sections[sec] = [
-                w.get("id", str(w)) if isinstance(w, dict) else str(w) for w in entries
+                dict(w) if isinstance(w, dict) else {"id": str(w)} for w in entries
             ]
         self.position = bar.get("position", "top")
         self.transparent = bool(bar.get("transparent", False))
@@ -901,7 +958,15 @@ class BarView(VerticalScroll):
             ol = self.query_one(f"#bar-{sec}", OptionList)
             hl = ol.highlighted
             ol.clear_options()
-            ol.add_options([Option(w, id=f"{sec}-{i}") for i, w in enumerate(self.sections[sec])])
+            ol.add_options(
+                [
+                    Option(
+                        str(w.get("id", w) if isinstance(w, dict) else w),
+                        id=f"{sec}-{i}",
+                    )
+                    for i, w in enumerate(self.sections[sec])
+                ]
+            )
             if section == sec and keep is not None and 0 <= keep < ol.option_count:
                 try:
                     ol.highlighted = keep
@@ -1011,17 +1076,35 @@ class KeybindingsView(Vertical):
                     yield Static("", id=f"kb-info-{tab}", classes="hint")
                     if tab == "hypr":
                         yield KbDataTable(id=f"kb-table-{tab}", cursor_type="row")
-                        yield Horizontal(
-                            Button("Edit…", id="kb-edit", variant="primary"),
-                            Button("Unbind", id="kb-unbind"),
-                            Button("Refresh", id="kb-refresh"),
-                            classes="buttons-row",
-                        )
                     else:
                         yield DataTable(id=f"kb-table-{tab}", cursor_type="row")
+        yield Horizontal(
+            Button("Edit…", id="kb-edit", variant="primary"),
+            Button("Unbind", id="kb-unbind"),
+            Button("Refresh", id="kb-refresh"),
+            classes="buttons-row",
+        )
 
     def on_mount(self) -> None:
         self.refresh_view()
+        self._set_hypr_edit(True)
+
+    def _hypr_active(self) -> bool:
+        try:
+            return str(self.query_one(TabbedContent).active) in ("pane-hypr", "hypr")
+        except Exception:
+            return True
+
+    def _set_hypr_edit(self, hypr: bool) -> None:
+        try:
+            self.query_one("#kb-edit", Button).disabled = not hypr
+            self.query_one("#kb-unbind", Button).disabled = not hypr
+        except Exception:
+            pass
+
+    @on(TabbedContent.TabActivated)
+    def _tab_activated(self, ev: TabbedContent.TabActivated) -> None:
+        self._set_hypr_edit(getattr(ev.pane, "id", "") == "pane-hypr")
 
     def refresh_view(self) -> None:
         cols, rows, overrides, defaults_off = build_hypr_rows()
@@ -1040,10 +1123,14 @@ class KeybindingsView(Vertical):
 
     @on(Button.Pressed, "#kb-edit")
     def _edit(self) -> None:
+        if not self._hypr_active():
+            return
         self.edit_selected()
 
     @on(Button.Pressed, "#kb-unbind")
     async def _unbind(self) -> None:
+        if not self._hypr_active():
+            return
         key = self._selected_key()
         if not key:
             self.notify("Select a binding first", severity="warning")
@@ -1058,6 +1145,8 @@ class KeybindingsView(Vertical):
 
     @work
     async def edit_selected(self) -> None:
+        if not self._hypr_active():
+            return
         key = self._selected_key()
         if not key:
             self.notify("Select a binding first", severity="warning")
@@ -1169,7 +1258,7 @@ class TerminalsView(Vertical):
         detected = self.terminals
         ol.add_options(
             [
-                Option(("● " if t in detected else "○ ") + t, id=f"term-{t}")
+                Option(("● " if t in detected else "○ ") + t, id=f"term-{slug(t)}")
                 for t in self.all_terms
             ]
         )
@@ -1280,7 +1369,7 @@ class PluginsView(Vertical):
         ol.clear_options()
         for p in self.plugins:
             state = "● " if plugin_enabled(p["id"]) else "○ "
-            ol.add_options([Option(state + p["id"], id=f"pl-{p['id']}")])
+            ol.add_options([Option(state + p["id"], id=f"pl-{slug(p['id'])}")])
         if self.plugins:
             self._detail(0)
 
@@ -1368,7 +1457,7 @@ class HooksView(VerticalScroll):
         for h in self.hooks:
             state = "● " if h["active"] else "○ "
             ol.add_options(
-                [Option(state + f"{h['event']}/{h['name']}", id=f"hk-{h['path'].stem}")]
+                [Option(state + f"{h['event']}/{h['name']}", id=f"hk-{slug(h['path'].stem)}")]
             )
         if self.hooks:
             self._detail(0)
@@ -1434,7 +1523,6 @@ class DefaultsView(VerticalScroll):
 
 class OmarchyCommandCenter(App):
     TITLE = "Omarchy Command Center"
-    CSS = APP_CSS
     BINDINGS = [
         Binding("f1", "goto_dashboard", "Dashboard", show=True),
         Binding("f2", "goto_themes", "Themes", show=True),
@@ -1469,6 +1557,17 @@ class OmarchyCommandCenter(App):
     def __init__(self):
         super().__init__()
         self._version = sh(["omarchy", "version"]) or "?"
+        self._apply_theme_css()
+
+    def _apply_theme_css(self) -> None:
+        global PALETTE, ACCENT, STEEL, FG
+        PALETTE = build_palette()
+        ACCENT = PALETTE["accent"]
+        STEEL = PALETTE["dark_foreground"]
+        FG = PALETTE["light_foreground"]
+        self.stylesheet.add_source(app_css(PALETTE), read_from=("", "occ-css"))
+        if self._is_mounted:
+            self.refresh_css()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="brand"):
