@@ -1,0 +1,1323 @@
+#!/usr/bin/env python3
+"""Omarchy Command Center — a unified TUI for managing Omarchy dotfiles.
+
+Single-file executable. Requires: python3, omarchy, and the `textual`
+library (pip install textual). Released into the public domain (CC0).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import time
+import tomllib
+from pathlib import Path
+from typing import Optional
+
+from textual import on
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    DataTable,
+    Footer,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    Static,
+    Switch,
+    TabbedContent,
+    TabPane,
+)
+from textual.widgets._option_list import Option
+
+CONFIG_DIR = Path("~/.config/omarchy").expanduser()
+SHELL_JSON = CONFIG_DIR / "shell.json"
+HOOKS_DIR = CONFIG_DIR / "hooks"
+PLUGINS_DIR = CONFIG_DIR / "plugins"
+DEFAULTS_DIR = CONFIG_DIR / "defaults"
+HYPR_BINDINGS = Path("~/.config/hypr/bindings.lua").expanduser()
+TMUX_CONF = Path("~/.config/tmux/tmux.conf").expanduser()
+HERDR_CONF = Path("~/.config/herdr/config.toml").expanduser()
+NVIM_KEYMAPS = Path("~/.config/nvim/lua/config/keymaps.lua").expanduser()
+
+TERMINAL_CONFS = {
+    "alacritty": Path("~/.config/alacritty/alacritty.toml").expanduser(),
+    "foot": Path("~/.config/foot/foot.ini").expanduser(),
+    "kitty": Path("~/.config/kitty/kitty.conf").expanduser(),
+    "ghostty": Path("~/.config/ghostty/config").expanduser(),
+}
+
+DEFAULTS = {
+    "agent": ["pi", "omp", "opencode", "claude", "codex", "grok", "gemini", "copilot", "crush"],
+    "browser": ["chromium", "chrome", "brave", "brave-origin", "edge", "firefox", "zen"],
+    "editor": ["code", "cursor", "zed", "sublime_text", "helix", "vim", "emacs", "nvim"],
+    "terminal": ["alacritty", "foot", "ghostty", "kitty"],
+}
+
+ACCENT = "#4A7BB5"
+STEEL = "#8A9096"
+FG = "#F2F3F5"
+
+CSS = """
+Screen { background: #07090C; }
+
+#brand { height: 3; background: #0E141C; padding: 0 3; layout: horizontal; }
+#brand-title { width: 1fr; content-align: left middle; color: #4A7BB5; text-style: bold; }
+#brand-meta { width: auto; content-align: right middle; color: #8A9096; }
+
+#body { layout: horizontal; height: 1fr; }
+#sidebar { width: 30; height: 1fr; border-right: solid #1A406A; background: #0D1117; }
+#sidebar OptionList { padding: 1; }
+#view-switcher { width: 1fr; height: 1fr; }
+
+#sidebar OptionList > .option-list--option--highlight {
+    background: #1A406A;
+    color: #F2F3F5;
+    text-style: bold;
+}
+
+Label { color: #B9C0C7; }
+Label.section-title { color: #4A7BB5; text-style: bold; padding: 1 1 0 1; }
+Label.kind-label { padding: 0 1; width: 12; }
+
+Static.hint { color: #8A9096; padding: 0 1; }
+Static.stat { padding: 0 1; }
+Static.theme-details { padding: 0 1; width: 1fr; }
+Static.swatch-text { padding: 1; }
+
+Horizontal.pads { padding: 1; }
+Horizontal.buttons-row { height: auto; padding: 0 1; }
+Vertical.col { height: 1fr; }
+
+OptionList { background: #0D1117; border: round #152033; height: 1fr; }
+#hook-list { height: 48; max-height: 60%; }
+OptionList:focus { border: round #4A7BB5; }
+OptionList > .option-list--option--highlight { background: #1A406A; color: #F2F3F5; }
+
+DataTable {
+    background: #0D1117;
+    border: round #152033;
+    height: 1fr;
+}
+DataTable > .datatable--header { background: #0E141C; color: #4A7BB5; text-style: bold; }
+DataTable > .datatable--cursor { background: #1A406A; color: #F2F3F5; }
+DataTable > .datatable--fixed { color: #4A7BB5; }
+
+Input { border: round #152033; background: #0D1117; }
+Input:focus { border: round #4A7BB5; }
+Input.search { width: 1fr; margin: 0 1; }
+
+Select { border: round #152033; background: #0D1117; }
+Select:focus { border: round #4A7BB5; }
+
+Button { background: #1A406A; color: #F2F3F5; border: none; min-width: 8; }
+Button:hover { background: #4A7BB5; color: #030406; }
+Button.primary { background: #4A7BB5; color: #030406; text-style: bold; }
+
+TabbedContent { height: 1fr; }
+TabbedContent > .tabbed-content--tab-label {
+    color: #8A9096;
+    padding: 0 2;
+}
+TabbedContent > .tabbed-content--tab-label.--active {
+    color: #F2F3F5;
+    text-style: bold;
+}
+TabPane { height: 1fr; }
+
+#kb-note { padding: 0 1; }
+
+.term-block, .plugin-block, .hook-block { width: 1fr; height: 1fr; }
+
+.defaults-row, .settings-row { height: 3; padding: 0 1; }
+.defaults-row Input, .settings-row Input, .settings-row Select, .settings-row Switch { width: 1fr; }
+.defaults-row Button, .settings-row Button { width: 12; }
+.settings-row Switch { background: #152033; }
+
+Footer { color: #B9C0C7; background: #0D1117; }
+"""
+
+
+def run(cmd: list[str], timeout: int = 90) -> tuple[str, str, int]:
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return res.stdout, res.stderr, res.returncode
+    except Exception as exc:
+        return "", str(exc), -1
+
+
+def sh(cmd: list[str]) -> str:
+    out, _err, code = run(cmd)
+    return out.strip() if code == 0 else ""
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def write_json(path: Path, data: dict, backup: bool = True) -> None:
+    if backup and path.exists():
+        bak = path.with_name(f"{path.name}.bak.{int(time.time())}")
+        try:
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def backup(path: Path) -> None:
+    if path.exists():
+        bak = path.with_name(f"{path.name}.bak.{int(time.time())}")
+        try:
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+
+
+def luminance(hexcol: str) -> float:
+    try:
+        r, g, b = (int(hexcol[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    except Exception:
+        return 0.5
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def swatch(name: str, hexcol: str) -> str:
+    fg = "#000000" if luminance(hexcol) > 0.5 else "#ffffff"
+    return f"[{fg} on {hexcol}] {name:<12} {hexcol} [/]"
+
+
+def shell_data() -> dict:
+    return read_json(SHELL_JSON)
+
+
+def theme_dirs() -> list[dict]:
+    result: list[dict] = []
+    seen: set[str] = set()
+
+    def is_theme(d: Path) -> bool:
+        if not d.is_dir():
+            return False
+        return (d / "colors.toml").exists() or any(f.name == "colors.toml" for f in d.rglob("*"))
+
+    for base, user in ((CONFIG_DIR / "themes", True), (Path("/usr/share/omarchy/themes"), False)):
+        if not base.is_dir():
+            continue
+        for d in sorted(base.iterdir()):
+            if d.name.startswith(".") or not is_theme(d):
+                continue
+            name = d.name
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append({"name": name, "dir": d, "user": user})
+    return result
+
+
+def theme_colors(tdir: Path) -> dict:
+    hits = [f for f in tdir.rglob("colors.toml") if f.is_file()]
+    if not hits:
+        return {}
+    try:
+        with hits[0].open("rb") as fh:
+            return tomllib.load(fh)
+    except Exception:
+        return {}
+
+
+def active_theme() -> str:
+    out = sh(["omarchy", "theme", "current"])
+    return out.splitlines()[0].strip() if out else ""
+
+
+def theme_names_match(a: str, b: str) -> bool:
+    return a.strip().lower().replace(" ", "-") == b.strip().lower()
+
+
+def plugin_entries() -> list[dict]:
+    entries = []
+    if not PLUGINS_DIR.is_dir():
+        return entries
+    for d in sorted(PLUGINS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        meta = {}
+        mf = d / "manifest.json"
+        if mf.exists():
+            try:
+                meta = json.loads(mf.read_text())
+            except Exception:
+                meta = {}
+        entries.append({"id": d.name, "dir": d, "meta": meta})
+    return entries
+
+
+def plugin_enabled(pid: str) -> bool:
+    data = shell_data()
+    if pid in (data.get("plugins") or []):
+        return True
+    for section in (data.get("bar") or {}).get("layout", {}).values():
+        for w in section or []:
+            if isinstance(w, dict) and w.get("id") == pid:
+                return True
+    return False
+
+
+def hook_entries() -> list[dict]:
+    entries = []
+    if not HOOKS_DIR.is_dir():
+        return entries
+    for d in sorted(HOOKS_DIR.glob("*.d")):
+        for f in sorted(d.iterdir()):
+            if not f.is_file():
+                continue
+            entries.append({"path": f, "event": d.name, "name": f.name, "active": not f.name.endswith(".sample")})
+    return entries
+
+
+def default_value(kind: str) -> str:
+    f = DEFAULTS_DIR / kind
+    try:
+        return f.read_text().strip()
+    except Exception:
+        return ""
+
+
+def build_hypr_rows() -> tuple[tuple[str, str], list, set, bool]:
+    out = sh(["omarchy", "menu", "keybindings", "--print"])
+    rows = []
+    for line in out.splitlines():
+        if "\u2192" not in line:
+            continue
+        key, desc = (p.strip() for p in line.split("\u2192", 1))
+        rows.append([key, desc])
+    overrides = set()
+    defaults_off = False
+    if HYPR_BINDINGS.exists():
+        for line in HYPR_BINDINGS.read_text().splitlines():
+            s = line.strip()
+            if not s or s.startswith("--"):
+                continue
+            if "omarchy_default_bindings = false" in s:
+                defaults_off = True
+            m = re_search(r'o\.bind\(\s*"([^"]+)"', s) or re_search(r'hl\.unbind\(\s*"([^"]+)"', s)
+            if m:
+                overrides.add(m)
+    marked = []
+    for row in rows:
+        if row[0] in overrides:
+            marked.append([row[0], row[1] + "   [user override]"])
+        else:
+            marked.append(row)
+    return ("Key Binding", "Description"), marked, overrides, defaults_off
+
+
+def re_search(pattern: str, text: str) -> Optional[str]:
+    m = re.search(pattern, text)
+    return m.group(1) if m else None
+
+
+def build_tmux_rows() -> list:
+    if not TMUX_CONF.exists():
+        return []
+    rows = []
+    for line in TMUX_CONF.read_text().splitlines():
+        s = line.strip()
+        if not s.startswith("bind "):
+            continue
+        m = re.match(r'bind\s+(?:-N\s+"(?P<desc>[^"]*)"\s+)?(?P<rest>.+)$', s)
+        if not m:
+            continue
+        desc = (m.group("desc") or "").strip()
+        toks = m.group("rest").split()
+        i = 0
+        while i < len(toks) and toks[i].startswith("-"):
+            if toks[i] == "-T" and i + 1 < len(toks):
+                i += 2
+            elif toks[i] in ("-t", "-b", "-g") and i + 1 < len(toks):
+                i += 2
+            else:
+                i += 1
+        if i >= len(toks):
+            continue
+        key = toks[i]
+        cmd = " ".join(toks[i + 1 :])
+        if not desc:
+            desc = cmd
+        rows.append([key, desc, cmd])
+    return rows
+
+
+def build_herdr_rows() -> list:
+    if not HERDR_CONF.exists():
+        return []
+    try:
+        data = tomllib.loads(HERDR_CONF.read_text())
+    except Exception:
+        return []
+    rows = []
+    for name, val in (data.get("keys") or {}).items():
+        if isinstance(val, list):
+            combo = ", ".join(val)
+        else:
+            combo = str(val)
+        desc = name.replace("_", " ").capitalize()
+        rows.append([desc, combo])
+    return rows
+
+
+def build_nvim_rows() -> list:
+    if not NVIM_KEYMAPS.exists():
+        return []
+    rows = []
+    for line in NVIM_KEYMAPS.read_text().splitlines():
+        m = re.search(
+            r'vim\.keymap\.set\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*,\s*["\'](.*?)["\']', line
+        )
+        if not m:
+            continue
+        mode, key, cmd = m.groups()
+        dm = re.search(r'desc\s*=\s*["\']([^"\']+)["\']', line)
+        purpose = dm.group(1) if dm else cmd
+        rows.append([mode, key, cmd, purpose])
+    return rows
+
+
+class DashboardView(VerticalScroll):
+    def compose(self) -> ComposeResult:
+        yield Static("", id="dash-stats", classes="stat")
+        yield Horizontal(
+            Vertical(
+                Label("Plugins", classes="section-title"),
+                OptionList(id="dash-plugins"),
+            ),
+            Vertical(
+                Label("Hooks", classes="section-title"),
+                OptionList(id="dash-hooks"),
+            ),
+            classes="pads",
+        )
+        yield Horizontal(Button("Refresh", id="dash-refresh", variant="primary"), classes="buttons-row")
+
+    @on(Button.Pressed, "#dash-refresh")
+    def _refresh_clicked(self) -> None:
+        self.refresh_view()
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        self.notify("Refreshing dashboard…", timeout=2)
+        version = sh(["omarchy", "version"]) or "unknown"
+        theme = active_theme() or "unknown"
+        bg = sh(["omarchy", "theme", "bg", "current"]) or "–"
+        check = sh(["omarchy", "commands", "--check"]) or "unavailable"
+        lc = check.lower()
+        if not check and check == "unavailable":
+            check_status = "unavailable"
+        elif "failed" in lc:
+            check_status = check.splitlines()[0].strip()[:30]
+        else:
+            check_status = "OK"
+
+        data = shell_data()
+        bar = data.get("bar") or {}
+        layout = bar.get("layout") or {}
+        idle = data.get("idle") or {}
+        position = bar.get("position", "top")
+        transparent = "yes" if bar.get("transparent") else "no"
+        anchor = bar.get("centerAnchor", "–")
+        lock = idle.get("lock", "–")
+        ssaver = idle.get("screensaver", "–")
+
+        themes = theme_dirs()
+        user_count = sum(1 for t in themes if t["user"])
+        builtin_count = len(themes) - user_count
+        plugins = plugin_entries()
+        hooks = hook_entries()
+        active_hooks = sum(1 for h in hooks if h["active"])
+
+        defaults = [f"{k}={default_value(k) or '–'}" for k in DEFAULTS]
+        hook_summary = f"{active_hooks} active · {len(hooks) - active_hooks} samples" if hooks else "none"
+
+        commands = [
+            ("Version", version),
+            ("Active theme", theme),
+            ("Background", bg),
+            ("Bar position", position),
+            ("Bar transparent", transparent),
+            ("Clock anchor", anchor),
+            ("Idle lock / screensaver", f"{lock}s / {ssaver}s"),
+            ("Default agent", default_value("agent") or "–"),
+            ("Defaults", ", ".join(defaults)),
+            ("Themes", f"{user_count} user · {builtin_count} built-in"),
+            ("Plugins", f"{len(plugins)} installed · {sum(plugin_enabled(p['id']) for p in plugins)} enabled"),
+            ("Hooks", hook_summary),
+            ("Commands check", check_status),
+        ]
+        lines = ["[b #4A7BB5]OMARCHY SYSTEM[/]", ""]
+        for label, value in commands:
+            lines.append(f"[b #8A9096]{label:<24}[/] {value}")
+        self.query_one("#dash-stats", Static).update("\n".join(lines))
+
+        plist = self.query_one("#dash-plugins", OptionList)
+        plist.clear_options()
+        plist.add_options(
+            [
+                Option(("● " if plugin_enabled(p["id"]) else "○ ") + p["id"], id=f"dp-{p['id']}")
+                for p in plugins
+            ]
+        )
+        hlist = self.query_one("#dash-hooks", OptionList)
+        hlist.clear_options()
+        hlist.add_options(
+            [
+                Option(
+                    ("● " if h["active"] else "○ ") + f"{h['event']}/{h['name']}",
+                    id=f"dh-{h['event']}-{h['name']}",
+                )
+                for h in hooks
+            ]
+        )
+
+
+class ThemesView(Vertical):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.themes: list[dict] = []
+        self.current = ""
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            with Vertical(id="themes-col-left", classes="col"):
+                yield Label("Themes — Enter to apply", classes="section-title")
+                yield OptionList(id="theme-list")
+            with Vertical(id="themes-col-right", classes="col"):
+                yield Label("Preview", classes="section-title")
+                yield Static("", id="theme-name", classes="stat")
+                yield Static("", id="theme-path", classes="hint")
+                yield Static("", id="theme-core", classes="swatch-text")
+                yield Static("", id="theme-palette", classes="swatch-text")
+                yield Horizontal(
+                    Button("Apply theme", id="theme-apply", variant="primary"),
+                    Button("Refresh", id="theme-refresh"),
+                    classes="buttons-row",
+                )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#theme-refresh")
+    def _refresh_clicked(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#theme-apply")
+    def _apply_clicked(self) -> None:
+        ol = self.query_one("#theme-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not self.themes:
+            self.notify("Select a theme first", severity="warning")
+            return
+        name = self.themes[idx]["name"]
+        self.notify(f"Applying theme {name}…", timeout=5)
+        out, err, code = run(["omarchy", "theme", "set", name])
+        if code == 0:
+            self.notify(f"Theme applied: {name}")
+        else:
+            self.notify(f"Failed to apply theme: {err.strip() or out.strip()}", severity="error")
+        self.refresh_view()
+
+    @on(OptionList.OptionHighlighted, "#theme-list")
+    def _highlighted(self, ev: OptionList.OptionHighlighted) -> None:
+        self._preview(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.current = active_theme()
+        self.themes = theme_dirs()
+        ol = self.query_one("#theme-list", OptionList)
+        ol.clear_options()
+        opts = []
+        for t in self.themes:
+            marker = "● " if theme_names_match(self.current, t["name"]) else "○ "
+            label = marker + t["name"]
+            if not t["user"]:
+                label += "  (built-in)"
+            opts.append(Option(label, id=f"th-{t['name']}"))
+        ol.add_options(opts)
+        if self.themes:
+            self._preview(0)
+
+    def _preview(self, idx: int) -> None:
+        if idx is None or not self.themes or not (0 <= idx < len(self.themes)):
+            return
+        t = self.themes[idx]
+        name = t["name"]
+        origin = "user" if t["user"] else "built-in"
+        self.query_one("#theme-name", Static).update(f"[b {ACCENT}]{name}[/]  [i]{origin}[/]")
+        self.query_one("#theme-path", Static).update(f"{t['dir']}")
+        colors = theme_colors(t["dir"])
+        if not colors:
+            self.query_one("#theme-core", Static).update(f"[{STEEL}]no colors.toml palette[/]")
+            self.query_one("#theme-palette", Static).update("")
+            return
+        core = []
+        for key in ("background", "foreground", "accent", "selection", "active_border_color"):
+            if colors.get(key):
+                core.append(swatch(key[:3] + ":" if key == "active_border_color" else key[:3], colors[key]))
+        self.query_one("#theme-core", Static).update("\n".join(self._chunk(core)))
+        p = []
+        for key in ("red", "green", "yellow", "blue", "magenta", "cyan", "orange", "brown"):
+            if colors.get(key):
+                p.append(swatch(key, colors[key]))
+        for key in (
+            "bright_red",
+            "bright_green",
+            "bright_yellow",
+            "bright_blue",
+            "bright_magenta",
+            "bright_cyan",
+        ):
+            if colors.get(key):
+                p.append(swatch(key.replace("bright_", "b-")[:12], colors[key]))
+        self.query_one("#theme-palette", Static).update("\n".join(self._chunk(p)))
+
+    @staticmethod
+    def _chunk(items: list[str], width: int = 4) -> list[str]:
+        return ["".join(items[i : i + width]) for i in range(0, len(items), width)]
+
+
+class BarView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sections = {"left": [], "center": [], "right": []}
+        self.position = "top"
+        self.transparent = False
+        self.anchor = ""
+        self.lock = 0
+        self.ssaver = 0
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            for sec in ("left", "center", "right"):
+                yield Vertical(
+                    Label(sec.upper() + " SECTION", classes="section-title"),
+                    OptionList(id=f"bar-{sec}"),
+                    classes="col",
+                )
+        yield Horizontal(
+            Button("▲ Up", id="btn-up"),
+            Button("▼ Down", id="btn-down"),
+            Button("◀ To prev", id="btn-prev"),
+            Button("▶ To next", id="btn-next"),
+            Button("Remove", id="btn-remove"),
+            Button("Add custom", id="btn-add"),
+            classes="buttons-row",
+        )
+        yield Horizontal(
+            Input(id="bar-add-input", placeholder="widget id e.g. omarchy.spacer"),
+            classes="pads",
+        )
+        for label, control in (
+            ("Position", Select(
+                [(l, v) for v, l in (("top", "Top"), ("bottom", "Bottom"), ("left", "Left"), ("right", "Right"))],
+                id="bar-pos",
+            )),
+            ("Transparent", Switch(id="bar-trans")),
+            ("Clock anchor", Input(id="bar-anchor", placeholder="e.g. omarchy.clock")),
+            ("Lock idle (s)", Input(id="bar-lock")),
+            ("Screensaver (s)", Input(id="bar-ssaver")),
+        ):
+            with Horizontal(classes="settings-row"):
+                yield Label(label, classes="kind-label")
+                yield control
+        yield Horizontal(
+            Button("Save & apply", id="btn-save", variant="primary"),
+            Button("Reset from disk", id="btn-reset"),
+            classes="buttons-row",
+        )
+
+    def on_mount(self) -> None:
+        self.load()
+
+    @on(Button.Pressed, "#btn-reset")
+    def _reset(self) -> None:
+        self.load()
+        self.notify("Bar config reloaded from disk")
+
+    @on(Button.Pressed, "#btn-up")
+    def _up(self) -> None:
+        self._move_selected(-1)
+
+    @on(Button.Pressed, "#btn-down")
+    def _down(self) -> None:
+        self._move_selected(1)
+
+    @on(Button.Pressed, "#btn-prev")
+    def _to_prev(self) -> None:
+        self._hop(-1)
+
+    @on(Button.Pressed, "#btn-next")
+    def _to_next(self) -> None:
+        self._hop(1)
+
+    @on(Button.Pressed, "#btn-remove")
+    def _remove(self) -> None:
+        sec = self._cur_section()
+        ol = self.query_one(f"#bar-{sec}", OptionList)
+        hl = ol.highlighted
+        if hl is None or not (0 <= hl < len(self.sections[sec])):
+            return
+        removed = self.sections[sec].pop(hl)
+        self._rerender(hl, sec)
+        self.notify(f"Removed {removed}")
+
+    @on(Button.Pressed, "#btn-add")
+    def _add_custom(self) -> None:
+        inp = self.query_one("#bar-add-input", Input)
+        wid = inp.value.strip()
+        if not wid:
+            self.notify("Enter a widget id first", severity="warning")
+            return
+        sec = self._cur_section()
+        self.sections[sec].append(wid)
+        inp.value = ""
+        self._rerender(len(self.sections[sec]) - 1, sec)
+        self.notify(f"Added {wid} to {sec}")
+
+    @on(Button.Pressed, "#btn-save")
+    def _save(self) -> None:
+        self._read_settings_inputs()
+        data = shell_data()
+        bar = data.setdefault("bar", {})
+        bar["layout"] = {k: [{"id": i} for i in v] for k, v in self.sections.items()}
+        bar["position"] = self.position
+        bar["transparent"] = self.transparent
+        bar["centerAnchor"] = self.anchor
+        data.setdefault("idle", {})
+        data["idle"]["lock"] = int(self.lock or 0)
+        data["idle"]["screensaver"] = int(self.ssaver or 0)
+        write_json(SHELL_JSON, data, backup=True)
+        run(["omarchy", "bar", "position", self.position])
+        run(["omarchy", "bar", "transparent", "true" if self.transparent else "false"])
+        self.notify("Bar config saved and applied")
+
+    def load(self) -> None:
+        data = shell_data()
+        bar = data.get("bar") or {}
+        layout = bar.get("layout") or {}
+        for sec in self.sections:
+            entries = layout.get(sec) or []
+            self.sections[sec] = [
+                w.get("id", str(w)) if isinstance(w, dict) else str(w) for w in entries
+            ]
+        self.position = bar.get("position", "top")
+        self.transparent = bool(bar.get("transparent", False))
+        self.anchor = bar.get("centerAnchor", "")
+        idle = data.get("idle") or {}
+        self.lock = idle.get("lock") or 0
+        self.ssaver = idle.get("screensaver") or 0
+        self._sync_settings_inputs()
+        self._rerender(0)
+
+    def _sync_settings_inputs(self) -> None:
+        try:
+            self.query_one("#bar-pos", Select).value = self.position
+        except Exception:
+            pass
+        self.query_one("#bar-trans", Switch).value = self.transparent
+        self.query_one("#bar-anchor", Input).value = self.anchor
+        self.query_one("#bar-lock", Input).value = str(self.lock)
+        self.query_one("#bar-ssaver", Input).value = str(self.ssaver)
+
+    def _read_settings_inputs(self) -> None:
+        try:
+            self.position = str(self.query_one("#bar-pos", Select).value)
+        except Exception:
+            pass
+        self.transparent = bool(self.query_one("#bar-trans", Switch).value)
+        self.anchor = self.query_one("#bar-anchor", Input).value.strip()
+        try:
+            self.lock = int(self.query_one("#bar-lock", Input).value.strip() or 0)
+        except ValueError:
+            self.lock = 0
+        try:
+            self.ssaver = int(self.query_one("#bar-ssaver", Input).value.strip() or 0)
+        except ValueError:
+            self.ssaver = 0
+
+    def _cur_section(self) -> str:
+        focused = self.app.focused
+        if focused is not None:
+            fid = getattr(focused, "id", None)
+            if fid in (f"bar-{s}" for s in self.sections):
+                return fid.removeprefix("bar-")
+        return "center"
+
+    def _move_selected(self, delta: int) -> None:
+        sec = self._cur_section()
+        ol = self.query_one(f"#bar-{sec}", OptionList)
+        hl = ol.highlighted
+        if hl is None or not (0 <= hl < len(self.sections[sec])):
+            return
+        j = hl + delta
+        if not (0 <= j < len(self.sections[sec])):
+            return
+        lst = self.sections[sec]
+        lst[hl], lst[j] = lst[j], lst[hl]
+        self._rerender(j, sec)
+
+    def _hop(self, step: int) -> None:
+        order = ["left", "center", "right"]
+        sec = self._cur_section()
+        ol = self.query_one(f"#bar-{sec}", OptionList)
+        hl = ol.highlighted
+        if hl is None or not (0 <= hl < len(self.sections[sec])):
+            return
+        item = self.sections[sec].pop(hl)
+        j_sec = (order.index(sec) + step) % 3
+        self.sections[order[j_sec]].append(item)
+        self._rerender(len(self.sections[order[j_sec]]) - 1, order[j_sec])
+
+    def _rerender(self, keep: Optional[int] = None, section: Optional[str] = None) -> None:
+        for sec in ("left", "center", "right"):
+            ol = self.query_one(f"#bar-{sec}", OptionList)
+            hl = ol.highlighted
+            ol.clear_options()
+            ol.add_options([Option(w, id=f"{sec}-{i}") for i, w in enumerate(self.sections[sec])])
+            if section == sec and keep is not None and 0 <= keep < ol.option_count:
+                try:
+                    ol.highlighted = keep
+                except Exception:
+                    pass
+            elif hl is not None and ol.option_count > 0:
+                try:
+                    ol.highlighted = min(hl, ol.option_count - 1)
+                except Exception:
+                    pass
+        if section is None and keep is not None:
+            for sec in ("left", "center", "right"):
+                ol = self.query_one(f"#bar-{sec}", OptionList)
+                if ol.option_count > 0:
+                    try:
+                        ol.highlighted = keep if 0 <= keep < ol.option_count else 0
+                    except Exception:
+                        pass
+                    break
+
+
+class KeybindingsView(Vertical):
+    TABS = (
+        ("hypr", "Hyprland", ("Key Binding", "Description")),
+        ("tmux", "Tmux", ("Key", "Description", "Command")),
+        ("herdr", "Herdr", ("Setting", "Combo")),
+        ("nvim", "Neovim", ("Mode", "Key", "Command", "Purpose")),
+    )
+    NOTES = {
+        "hypr": "Defaults from `omarchy menu keybindings --print`. User overrides live in ~/.config/hypr/bindings.lua — flagged in rows.",
+        "tmux": "Parsed from ~/.config/tmux/tmux.conf. Herdr mirrors these mappings; see the Herdr tab.",
+        "herdr": "Parsed from ~/.config/herdr/config.toml [keys]. Mirrors the tmux bindings in workspace/tab/pane terms.",
+        "nvim": "Parsed from ~/.config/nvim/lua/config/keymaps.lua. LazyVim defaults apply unless overridden here.",
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rows: dict[str, list] = {}
+        self.hypr_overrides: set = set()
+        self.hypr_defaults_off = False
+
+    def compose(self) -> ComposeResult:
+        with TabbedContent():
+            for tab, label, _cols in self.TABS:
+                with TabPane(label, id=f"pane-{tab}"):
+                    yield Static(self.NOTES[tab], id=f"kb-note-{tab}", classes="hint")
+                    yield Input(id=f"kb-search-{tab}", classes="search", placeholder="Search…")
+                    yield Static("", id=f"kb-info-{tab}", classes="hint")
+                    yield DataTable(id=f"kb-table-{tab}", cursor_type="row")
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        cols, rows, overrides, defaults_off = build_hypr_rows()
+        self.rows["hypr"] = rows
+        self.rows["tmux"] = build_tmux_rows()
+        self.rows["herdr"] = build_herdr_rows()
+        self.rows["nvim"] = build_nvim_rows()
+        for tab, _label, cols_def in self.TABS:
+            self.render_table(tab, cols_def)
+        if defaults_off:
+            self.notify("Hyprland default bindings are all disabled (bindings.lua flag)", timeout=3)
+
+    @on(Input.Changed)
+    def _search(self, ev: Input.Changed) -> None:
+        if not ev.input.id or not ev.input.id.startswith("kb-search-"):
+            return
+        tab = ev.input.id.removeprefix("kb-search-")
+        cols = next(c for t, _l, c in self.TABS if t == tab)
+        self.render_table(tab, cols)
+
+    def render_table(self, tab: str, columns: tuple) -> None:
+        query = self.query_one(f"#kb-search-{tab}", Input).value.strip().lower()
+        rows = self.rows.get(tab) or []
+        table = self.query_one(f"#kb-table-{tab}", DataTable)
+        table.clear(columns=True)
+        table.add_columns(*columns)
+        filtered = [r for r in rows if not query or any(query in str(c).lower() for c in r)]
+        if filtered:
+            table.add_rows(filtered)
+        self.query_one(f"#kb-info-{tab}", Static).update(f"{len(filtered)} of {len(rows)} rows")
+
+
+class TerminalsView(Vertical):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.terminals: list[str] = []
+        self.all_terms: list[str] = list(TERMINAL_CONFS)
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Terminals", classes="section-title"),
+                OptionList(id="term-list"),
+                Horizontal(
+                    Button("Set as default", id="term-default", variant="primary"),
+                    Button("Refresh", id="term-refresh"),
+                    classes="buttons-row",
+                ),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Config", classes="section-title"),
+                Static("", id="term-detected", classes="hint"),
+                Static("", id="term-current", classes="hint"),
+                Static("", id="term-path", classes="hint"),
+                Static("", id="term-detail", classes="stat"),
+                classes="col",
+            )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#term-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#term-default")
+    def _set_default(self) -> None:
+        ol = self.query_one("#term-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.all_terms)):
+            self.notify("Select a terminal first", severity="warning")
+            return
+        name = self.all_terms[idx]
+        out, err, code = run(["omarchy", "default", "terminal", name])
+        if code == 0:
+            self.notify(f"Default terminal: {name}")
+        else:
+            self.notify(f"Failed: {err.strip() or out.strip()}", severity="error")
+
+    @on(OptionList.OptionHighlighted, "#term-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        self._detail(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.terminals = [t for t in TERMINAL_CONFS if shutil.which(t)]
+        ol = self.query_one("#term-list", OptionList)
+        ol.clear_options()
+        detected = self.terminals
+        ol.add_options(
+            [
+                Option(("● " if t in detected else "○ ") + t, id=f"term-{t}")
+                for t in self.all_terms
+            ]
+        )
+        current = default_value("terminal") or "(unset — xdg-terminal-exec)"
+        self.query_one("#term-current", Static).update(f"[b {ACCENT}]Default[/]  {current}")
+
+        installed = ", ".join(detected) or "none detected"
+        self.query_one("#term-detected", Static).update(f"[b]Detected[/]  {installed}")
+        if self.terminals:
+            self._detail(0)
+
+    def _detail(self, idx: int) -> None:
+        if not (0 <= idx < len(self.all_terms)):
+            return
+        name = self.all_terms[idx]
+        self.query_one("#term-path", Static).update(f"[b {STEEL}]Config[/]  {TERMINAL_CONFS[name]}")
+        detail = []
+        path = TERMINAL_CONFS[name]
+        if not path.exists():
+            detail.append(f"[{STEEL}]not present[/]")
+        else:
+            detail.append(f"[{STEEL}]size {path.stat().st_size} bytes[/]")
+            for line in path.read_text().splitlines():
+                s = line.strip()
+                if s.startswith("include") or s.startswith("import") or s.startswith("source"):
+                    detail.append(f"[{ACCENT}]themed via:[/] {s}")
+                elif s and not s.startswith("#"):
+                    first = s[:72]
+                    try:
+                        detail.append(first)
+                    except Exception:
+                        pass
+                    break
+        self.query_one("#term-detail", Static).update("\n".join(detail))
+
+
+class PluginsView(Vertical):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.plugins: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Plugins", classes="section-title"),
+                OptionList(id="plugin-list"),
+                Horizontal(
+                    Button("Toggle enable", id="plugin-toggle"),
+                    Button("Open folder", id="plugin-open"),
+                    Button("Refresh", id="plugin-refresh"),
+                    classes="buttons-row",
+                ),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Details", classes="section-title"),
+                Static("", id="plugin-name", classes="stat"),
+                Static("", id="plugin-meta", classes="hint"),
+                Static("", id="plugin-desc", classes="hint"),
+                classes="col",
+            )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#plugin-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#plugin-open")
+    def _open(self) -> None:
+        idx = self.query_one("#plugin-list", OptionList).highlighted
+        if idx is not None and 0 <= idx < len(self.plugins):
+            run(["xdg-open", str(self.plugins[idx]["dir"])])
+
+    @on(Button.Pressed, "#plugin-toggle")
+    def _toggle(self) -> None:
+        ol = self.query_one("#plugin-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.plugins)):
+            self.notify("Select a plugin first", severity="warning")
+            return
+        pid = self.plugins[idx]["id"]
+        data = shell_data()
+        plist = list(data.get("plugins") or [])
+        enabled = plugin_enabled(pid)
+        if enabled:
+            self.notify(f"No-op: {pid} is a bar widget — remove it in the Bar screen to disable")
+            if pid in plist:
+                plist.remove(pid)
+                data["plugins"] = plist
+                write_json(SHELL_JSON, data, backup=True)
+        else:
+            if pid not in plist:
+                plist.append(pid)
+                data["plugins"] = plist
+                write_json(SHELL_JSON, data, backup=True)
+            self.notify(f"Registered {pid} in shell.json plugins (add its widget in Bar to show it)")
+        self.refresh_view()
+
+    @on(OptionList.OptionHighlighted, "#plugin-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        self._detail(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.plugins = plugin_entries()
+        ol = self.query_one("#plugin-list", OptionList)
+        ol.clear_options()
+        for p in self.plugins:
+            state = "● " if plugin_enabled(p["id"]) else "○ "
+            ol.add_options([Option(state + p["id"], id=f"pl-{p['id']}")])
+        if self.plugins:
+            self._detail(0)
+
+    def _detail(self, idx: int) -> None:
+        if not (0 <= idx < len(self.plugins)):
+            return
+        p = self.plugins[idx]
+        meta = p["meta"]
+        state = "enabled" if plugin_enabled(p["id"]) else "disabled"
+        self.query_one("#plugin-name", Static).update(
+            f"[b {ACCENT}]{p['id']}[/]  [i]{state}[/]"
+        )
+        lines = []
+        for key in ("name", "version", "author", "kinds", "description"):
+            if meta.get(key):
+                lines.append(f"[b {STEEL}]{key}[/] {meta[key]}")
+        if meta.get("barWidget"):
+            bw = meta["barWidget"]
+            lines.append(f"[b {STEEL}]bar[/] {bw.get('displayName','')} — {bw.get('description','')}")
+        if meta.get("omarchy"):
+            lines.append(f"[b {STEEL}]omarchy[/] {meta['omarchy']}")
+        self.query_one("#plugin-meta", Static).update("\n".join(lines) if lines else "[i]no manifest.json[/]")
+        self.query_one("#plugin-desc", Static).update(f"dir: {p['dir']}")
+
+
+class HooksView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hooks: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Lifecycle hooks (dir/file)", classes="section-title"),
+                OptionList(id="hook-list"),
+                Horizontal(
+                    Button("Toggle on/off", id="hook-toggle", variant="primary"),
+                    Button("Refresh", id="hook-refresh"),
+                    classes="buttons-row",
+                ),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Contents", classes="section-title"),
+                Static("", id="hook-path", classes="hint"),
+                Static("", id="hook-content", classes="stat"),
+                classes="col",
+            )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#hook-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#hook-toggle")
+    def _toggle(self) -> None:
+        ol = self.query_one("#hook-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.hooks)):
+            self.notify("Select a hook first", severity="warning")
+            return
+        h = self.hooks[idx]
+        path = h["path"]
+        if h["active"]:
+            new = path.with_name(path.name + ".sample")
+        else:
+            new = path.with_name(path.name.removesuffix(".sample"))
+        try:
+            path.rename(new)
+            self.notify(f"{'Disabled' if h['active'] else 'Enabled'}: {h['name']}")
+        except Exception as exc:
+            self.notify(f"Failed: {exc}", severity="error")
+        self.refresh_view()
+
+    @on(OptionList.OptionHighlighted, "#hook-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        self._detail(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.hooks = hook_entries()
+        ol = self.query_one("#hook-list", OptionList)
+        ol.clear_options()
+        for h in self.hooks:
+            state = "● " if h["active"] else "○ "
+            ol.add_options(
+                [Option(state + f"{h['event']}/{h['name']}", id=f"hk-{h['path'].stem}")]
+            )
+        if self.hooks:
+            self._detail(0)
+
+    def _detail(self, idx: int) -> None:
+        if not (0 <= idx < len(self.hooks)):
+            return
+        h = self.hooks[idx]
+        self.query_one("#hook-path", Static).update(str(h["path"]))
+        content = h["path"].read_text(errors="replace")
+        lines = content.splitlines()
+        preview = "\n".join(lines if len(lines) <= 40 else lines[:40] + ["… (truncated)"])
+        self.query_one("#hook-content", Static).update(preview if preview.strip() else "[i]empty[/]")
+
+
+class DefaultsView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kinds = list(DEFAULTS)
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            f"Values are written via `omarchy default <kind> <value>` into ~/.config/omarchy/defaults.",
+            classes="hint",
+        )
+        for kind in self.kinds:
+            with Horizontal(classes="defaults-row"):
+                yield Label(kind, classes="kind-label")
+                yield Input(id=f"def-{kind}", placeholder=", ".join(DEFAULTS[kind]))
+                yield Button("Apply", id=f"def-apply-{kind}")
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed)
+    def _apply(self, ev: Button.Pressed) -> None:
+        if not ev.button.id or not ev.button.id.startswith("def-apply-"):
+            return
+        kind = ev.button.id.removeprefix("def-apply-")
+        value = self.query_one(f"#def-{kind}", Input).value.strip()
+        candidates = DEFAULTS.get(kind, [])
+        if not value:
+            self.notify("Enter a value first", severity="warning")
+            return
+        if candidates and value not in candidates:
+            self.notify(
+                f"{value} is not a known {kind} ({', '.join(candidates)})",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        out, err, code = run(["omarchy", "default", kind, value])
+        if code == 0:
+            self.notify(f"Default {kind} → {value}")
+        else:
+            self.notify(f"Failed: {err.strip() or out.strip()}", severity="error")
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        for kind in self.kinds:
+            self.query_one(f"#def-{kind}", Input).value = default_value(kind)
+
+
+class OmarchyCommandCenter(App):
+    TITLE = "Omarchy Command Center"
+    CSS = CSS
+    BINDINGS = [
+        Binding("f1", "goto_dashboard", "Dashboard", show=True),
+        Binding("f2", "goto_themes", "Themes", show=True),
+        Binding("f3", "goto_bar", "Bar", show=True),
+        Binding("f4", "goto_keybindings", "Keybindings", show=True),
+        Binding("f5", "goto_terminals", "Terminals", show=True),
+        Binding("f6", "goto_plugins", "Plugins", show=True),
+        Binding("f7", "goto_hooks", "Hooks", show=True),
+        Binding("f8", "goto_defaults", "Defaults", show=True),
+        Binding("1", "goto_dashboard", "Dashboard", show=False),
+        Binding("2", "goto_themes", "Themes", show=False),
+        Binding("3", "goto_bar", "Bar", show=False),
+        Binding("4", "goto_keybindings", "Keybindings", show=False),
+        Binding("5", "goto_terminals", "Terminals", show=False),
+        Binding("6", "goto_plugins", "Plugins", show=False),
+        Binding("7", "goto_hooks", "Hooks", show=False),
+        Binding("8", "goto_defaults", "Defaults", show=False),
+        Binding("r", "refresh_current", "Refresh", show=True),
+        Binding("q", "quit", "Quit", show=True, priority=True),
+    ]
+    VIEWS = [
+        ("dashboard", "Dashboard"),
+        ("themes", "Themes"),
+        ("bar", "Bar"),
+        ("keybindings", "Keybindings"),
+        ("terminals", "Terminals"),
+        ("plugins", "Plugins"),
+        ("hooks", "Hooks"),
+        ("defaults", "Defaults"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self._version = sh(["omarchy", "version"]) or "?"
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="brand"):
+            yield Static(f"OMARCHY  COMMAND CENTER", id="brand-title")
+            yield Static(f"v{self._version}", id="brand-meta")
+        with Horizontal(id="body"):
+            yield OptionList(
+                *[
+                    Option(f"{i + 1}: {label}", id=vid)
+                    for (vid, label), i in zip(self.VIEWS, range(len(self.VIEWS)))
+                ],
+                id="sidebar",
+            )
+            with ContentSwitcher(id="view-switcher"):
+                yield DashboardView(id="dashboard")
+                yield ThemesView(id="themes")
+                yield BarView(id="bar")
+                yield KeybindingsView(id="keybindings")
+                yield TerminalsView(id="terminals")
+                yield PluginsView(id="plugins")
+                yield HooksView(id="hooks")
+                yield DefaultsView(id="defaults")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#view-switcher", ContentSwitcher).current = "dashboard"
+        try:
+            self.query_one("#sidebar", OptionList).highlighted = 0
+        except Exception:
+            pass
+
+    @on(OptionList.OptionSelected, "#sidebar")
+    def _nav(self, ev: OptionList.OptionSelected) -> None:
+        self._show(str(ev.option_id))
+
+    def _show(self, view_id: str) -> None:
+        switcher = self.query_one("#view-switcher", ContentSwitcher)
+        if view_id not in {c.id for c in switcher.children}:
+            return
+        switcher.current = view_id
+        widget = self.query_one(f"#{view_id}")
+        if hasattr(widget, "refresh_view"):
+            widget.refresh_view()
+        try:
+            ol = self.query_one("#sidebar", OptionList)
+            for i, (vid, _label) in enumerate(self.VIEWS):
+                if vid == view_id:
+                    ol.highlighted = i
+                    break
+        except Exception:
+            pass
+
+    def action_goto_dashboard(self) -> None:
+        self._show("dashboard")
+
+    def action_goto_themes(self) -> None:
+        self._show("themes")
+
+    def action_goto_bar(self) -> None:
+        self._show("bar")
+
+    def action_goto_keybindings(self) -> None:
+        self._show("keybindings")
+
+    def action_goto_terminals(self) -> None:
+        self._show("terminals")
+
+    def action_goto_plugins(self) -> None:
+        self._show("plugins")
+
+    def action_goto_hooks(self) -> None:
+        self._show("hooks")
+
+    def action_goto_defaults(self) -> None:
+        self._show("defaults")
+
+    def action_refresh_current(self) -> None:
+        current = self.query_one("#view-switcher", ContentSwitcher).current
+        widget = self.query_one(f"#{current}")
+        if hasattr(widget, "refresh_view"):
+            widget.refresh_view()
+
+
+if __name__ == "__main__":
+    OmarchyCommandCenter().run()
