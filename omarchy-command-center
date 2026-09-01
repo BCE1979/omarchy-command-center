@@ -246,11 +246,98 @@ def luminance(hexcol: str) -> float:
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-def swatch(name: str, hexcol: str) -> Static:
+def color_name(hexcol: str) -> str:
+    raw = hexcol.strip().lstrip("#")
+    if len(raw) == 3:
+        raw = "".join(c * 2 for c in raw)
+    try:
+        r, g, b = (int(raw[i : i + 2], 16) / 255 for i in (0, 2, 4))
+    except Exception:
+        return "color"
+    mx, mn = max(r, g, b), min(r, g, b)
+    lit = (mx + mn) / 2
+    if mx == mn:
+        hue, sat = 0.0, 0.0
+    else:
+        d = mx - mn
+        sat = d / (1 - abs(2 * lit - 1)) if lit not in (0, 1) else 0.0
+        if mx == r:
+            hue = ((g - b) / d) % 6
+        elif mx == g:
+            hue = (b - r) / d + 2
+        else:
+            hue = (r - g) / d + 4
+        hue *= 60
+    if sat < 0.12:
+        if lit < 0.08:
+            return "black"
+        if lit < 0.22:
+            return "charcoal"
+        if lit < 0.40:
+            return "gray"
+        if lit < 0.62:
+            return "silver"
+        if lit < 0.92:
+            return "light-gray"
+        return "white"
+    if sat < 0.30:
+        if lit >= 0.80:
+            return "silver"
+        if lit <= 0.20:
+            return "charcoal"
+        if hue < 50 and lit < 0.42:
+            return "brown"
+        if 25 <= hue < 85:
+            return "taupe" if lit > 0.45 else "olive"
+        if 85 <= hue < 165:
+            return "sage"
+        if 165 <= hue < 255:
+            return "slate"
+        if 255 <= hue < 330:
+            return "mauve"
+        return "taupe" if hue < 25 or hue >= 330 else "steel"
+    if lit < 0.18:
+        shade = "dark "
+    elif lit > 0.78:
+        shade = "light "
+    else:
+        shade = ""
+    if hue < 12 or hue >= 348:
+        tone = "peach" if lit > 0.70 else "red"
+    elif hue < 32:
+        tone = "orange"
+    elif hue < 48:
+        tone = "amber"
+    elif hue < 72:
+        tone = "yellow"
+    elif hue < 150:
+        tone = "green"
+    elif hue < 175:
+        tone = "teal"
+    elif hue < 200:
+        tone = "cyan"
+    elif hue < 250:
+        if lit < 0.32:
+            tone = "navy"
+        elif lit > 0.45 and hue < 225:
+            tone = "sky"
+        else:
+            tone = "blue"
+    elif hue < 275:
+        tone = "indigo"
+    elif hue < 310:
+        tone = "purple"
+    elif hue < 335:
+        tone = "magenta"
+    else:
+        tone = "pink"
+    return (shade + tone).strip()
+
+
+def swatch(hexcol: str, label: str | None = None) -> Static:
     fg = "#000000" if luminance(hexcol) > 0.5 else "#ffffff"
-    chip = Static(f"{name} {hexcol}", markup=False, classes="swatch")
-    chip.styles.background = hexcol
-    chip.styles.color = fg
+    chip = Static(f"{label or color_name(hexcol)}  {hexcol}", markup=False, classes="swatch")
+    chip.set_styles(f"background: {hexcol}; color: {fg};")
     return chip
 
 
@@ -716,39 +803,46 @@ class ThemesView(Vertical):
         self.query_one("#theme-path", Static).update(f"{t['dir']}")
         colors = theme_colors(t["dir"])
         core_keys = ("background", "foreground", "accent", "selection", "active_border_color")
-        pal_keys = (
-            "red",
-            "green",
-            "yellow",
-            "blue",
-            "magenta",
-            "cyan",
-            "orange",
-            "brown",
-            "bright_red",
-            "bright_green",
-            "bright_yellow",
-            "bright_blue",
-            "bright_magenta",
-            "bright_cyan",
-        )
         if not colors:
-            self._fill_swatches("#theme-core", [])
+            self._fill_swatch_rows("#theme-core", [])
             self.query_one("#theme-core").mount(Static(f"[{STEEL}]no colors.toml palette[/]", classes="hint"))
-            self._fill_swatches("#theme-palette", [])
+            self._fill_swatch_rows("#theme-palette", [])
             return
-        self._fill_swatches("#theme-core", [(k, colors[k]) for k in core_keys if colors.get(k)])
-        self._fill_swatches("#theme-palette", [(k, colors[k]) for k in pal_keys if colors.get(k)])
+        self._fill_swatch_rows(
+            "#theme-core",
+            self._pairs([(k, colors[k]) for k in core_keys if self._is_hex(colors.get(k))]),
+            roles=True,
+        )
+        self._fill_swatch_rows("#theme-palette", self._ansi_rows(colors))
 
-    def _fill_swatches(self, widget_id: str, items: list[tuple[str, object]]) -> None:
+    @staticmethod
+    def _is_hex(val: object) -> bool:
+        return isinstance(val, str) and val.startswith("#") and len(val) >= 4
+
+    @staticmethod
+    def _pairs(items: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+        return [items[i : i + 2] for i in range(0, len(items), 2)]
+
+    def _ansi_rows(self, colors: dict) -> list[list[tuple[str, str]]]:
+        rows: list[list[tuple[str, str]]] = []
+        for base in ("red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"):
+            row: list[tuple[str, str]] = []
+            if self._is_hex(colors.get(base)):
+                row.append((base, colors[base]))
+            bright = f"bright_{base}"
+            if self._is_hex(colors.get(bright)):
+                row.append((bright, colors[bright]))
+            if row:
+                rows.append(row)
+        return rows
+
+    def _fill_swatch_rows(self, widget_id: str, rows: list[list[tuple[str, str]]], *, roles: bool = False) -> None:
         box = self.query_one(widget_id)
         box.remove_children()
-        chips = []
-        for name, val in items:
-            if isinstance(val, str) and val.startswith("#"):
-                chips.append(swatch(name, val))
-        for i in range(0, len(chips), 2):
-            box.mount(Horizontal(*chips[i : i + 2], classes="swatch-row"))
+        for row in rows:
+            chips = [swatch(val, name if roles else None) for name, val in row]
+            if chips:
+                box.mount(Horizontal(*chips, classes="swatch-row"))
 
 
 class BarView(VerticalScroll):
