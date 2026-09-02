@@ -1,0 +1,3291 @@
+#!/usr/bin/env python3
+"""Omarchy Command Center — a unified TUI for managing Omarchy dotfiles.
+
+Single-file executable. Requires: python3, omarchy, and the `textual`
+library (pip install textual). Released into the public domain (CC0).
+"""
+
+from __future__ import annotations
+
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import tomllib
+from pathlib import Path
+from typing import Optional
+
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    DataTable,
+    Footer,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    Static,
+    Switch,
+    TabbedContent,
+    TabPane,
+)
+from textual.widgets._option_list import Option
+
+CONFIG_DIR = Path("~/.config/omarchy").expanduser()
+SHELL_JSON = CONFIG_DIR / "shell.json"
+CC_JSON = CONFIG_DIR / "command-center.json"
+HOOKS_DIR = CONFIG_DIR / "hooks"
+PLUGINS_DIR = CONFIG_DIR / "plugins"
+DEFAULTS_DIR = CONFIG_DIR / "defaults"
+HYPR_BINDINGS = Path("~/.config/hypr/bindings.lua").expanduser()
+TMUX_CONF = Path("~/.config/tmux/tmux.conf").expanduser()
+HERDR_CONF = Path("~/.config/herdr/config.toml").expanduser()
+NVIM_KEYMAPS = Path("~/.config/nvim/lua/config/keymaps.lua").expanduser()
+
+WORKSPACE_CONFIG = Path("~/.config/hypr/workspaces.lua").expanduser()
+WORKSPACE_NAMES_JSON = CONFIG_DIR / "workspace-names.json"
+HYPR_INPUT = Path("~/.config/hypr/input.lua").expanduser()
+USER_BG_DIR = Path("~/.config/omarchy/backgrounds").expanduser()
+WORKSPACE_SLOT_COUNT = 10
+OCC_INPUT_BEGIN = "-- BEGIN occ-input"
+OCC_INPUT_END = "-- END occ-input"
+
+
+def get_wallpaper_dir() -> Path:
+    theme_name = active_theme()
+    if not theme_name:
+        return Path("~/.config/omarchy/themes").expanduser()
+    slug = theme_name.lower().replace(" ", "-")
+    user_bg = USER_BG_DIR / slug
+    if user_bg.is_dir():
+        return user_bg
+    theme_dir = Path("~/.config/omarchy/themes").expanduser() / slug
+    if theme_dir.is_dir() and (theme_dir / "backgrounds").is_dir():
+        return theme_dir / "backgrounds"
+    for base in [Path("/usr/share/omarchy/themes"), Path("~/.config/omarchy/themes").expanduser()]:
+        for d in base.iterdir():
+            if d.is_dir() and theme_names_match(d.name, theme_name):
+                if (d / "backgrounds").is_dir():
+                    return d / "backgrounds"
+    return Path("~/.config/omarchy/themes").expanduser()
+
+TERMINAL_CONFS = {
+    "alacritty": Path("~/.config/alacritty/alacritty.toml").expanduser(),
+    "foot": Path("~/.config/foot/foot.ini").expanduser(),
+    "kitty": Path("~/.config/kitty/kitty.conf").expanduser(),
+    "ghostty": Path("~/.config/ghostty/config").expanduser(),
+}
+
+DEFAULTS = {
+    "agent": ["pi", "omp", "opencode", "claude", "codex", "grok", "gemini", "copilot", "crush"],
+    "browser": ["chromium", "chrome", "brave", "brave-origin", "edge", "firefox", "zen"],
+    "editor": ["code", "cursor", "zed", "sublime_text", "helix", "vim", "emacs", "nvim"],
+    "terminal": ["alacritty", "foot", "ghostty", "kitty"],
+}
+
+_HOLMES = {
+    "background": "#07090C",
+    "dark_background": "#05070A",
+    "darker_background": "#030406",
+    "lighter_background": "#0E141C",
+    "foreground": "#E6E8EA",
+    "dark_foreground": "#8A9096",
+    "light_foreground": "#F2F3F5",
+    "bright_foreground": "#F7F8F9",
+    "accent": "#4A7BB5",
+    "selection": "#152033",
+    "muted": "#676B6E",
+    "active_tab_background": "#1A406A",
+}
+
+
+def build_palette() -> dict[str, str]:
+    colors = {}
+    for t in theme_dirs():
+        if theme_names_match(active_theme(), t["name"]):
+            colors = theme_colors(t["dir"])
+            break
+    palette = dict(_HOLMES)
+    for key in _HOLMES:
+        val = colors.get(key)
+        if isinstance(val, str) and val.startswith("#"):
+            palette[key] = val
+    return palette
+
+
+def app_css(p: dict[str, str]) -> str:
+    def fgon(hexcol: str) -> str:
+        return p["darker_background"] if luminance(hexcol) > 0.5 else p["light_foreground"]
+
+    return f"""
+Screen {{ background: {p["background"]}; }}
+
+#brand {{ height: 3; background: {p["lighter_background"]}; padding: 0 3; layout: horizontal; }}
+#brand-title {{ width: 1fr; content-align: left middle; color: {p["accent"]}; text-style: bold; }}
+#brand-meta {{ width: auto; content-align: right middle; color: {p["dark_foreground"]}; }}
+
+#body {{ layout: horizontal; height: 1fr; }}
+#sidebar {{ width: 30; height: 1fr; border-right: solid {p["active_tab_background"]}; background: {p["dark_background"]}; }}
+#sidebar OptionList {{ padding: 1; }}
+#view-switcher {{ width: 1fr; height: 1fr; }}
+
+#sidebar OptionList > .option-list--option--highlight {{
+    background: {p["active_tab_background"]};
+    color: {fgon(p["active_tab_background"])};
+    text-style: bold;
+}}
+
+Label {{ color: {p["foreground"]}; }}
+Label.section-title {{ color: {p["accent"]}; text-style: bold; padding: 1 1 0 1; }}
+Label.kind-label {{ padding: 0 1; width: 12; }}
+
+Static.hint {{ color: {p["dark_foreground"]}; padding: 0 1; }}
+Static.stat {{ padding: 0 1; }}
+Static.theme-details {{ padding: 0 1; width: 1fr; }}
+.swatch-box {{ height: auto; padding: 0 1; }}
+.swatch-row {{ height: 1; width: 100%; }}
+Static.swatch {{ width: 1fr; height: 1; padding: 0 1; }}
+
+Horizontal.pads {{ padding: 1; }}
+Horizontal.buttons-row {{ height: auto; padding: 0 1; }}
+Vertical.col {{ height: 1fr; }}
+
+OptionList {{ background: {p["dark_background"]}; border: round {p["selection"]}; height: 1fr; }}
+#hook-list {{ height: 48; max-height: 60%; }}
+OptionList:focus {{ border: round {p["accent"]}; }}
+OptionList > .option-list--option--highlight {{ background: {p["active_tab_background"]}; color: {fgon(p["active_tab_background"])}; }}
+
+DataTable {{
+    background: {p["dark_background"]};
+    border: round {p["selection"]};
+    height: 1fr;
+}}
+DataTable > .datatable--header {{ background: {p["lighter_background"]}; color: {p["accent"]}; text-style: bold; }}
+DataTable > .datatable--cursor {{ background: {p["active_tab_background"]}; color: {fgon(p["active_tab_background"])}; }}
+DataTable > .datatable--fixed {{ color: {p["accent"]}; }}
+
+Input {{ border: round {p["selection"]}; background: {p["dark_background"]}; }}
+Input:focus {{ border: round {p["accent"]}; }}
+Input.search {{ width: 1fr; margin: 0 1; }}
+
+Select {{ border: round {p["selection"]}; background: {p["dark_background"]}; }}
+Select:focus {{ border: round {p["accent"]}; }}
+
+Button {{ background: {p["active_tab_background"]}; color: {fgon(p["active_tab_background"])}; border: none; min-width: 8; }}
+Button:hover {{ background: {p["accent"]}; color: {fgon(p["accent"])}; }}
+Button.primary {{ background: {p["accent"]}; color: {fgon(p["accent"])}; text-style: bold; }}
+
+TabbedContent {{ height: 1fr; }}
+TabbedContent > .tabbed-content--tab-label {{
+    color: {p["dark_foreground"]};
+    padding: 0 2;
+}}
+TabbedContent > .tabbed-content--tab-label.--active {{
+    color: {p["light_foreground"]};
+    text-style: bold;
+}}
+TabPane {{ height: 1fr; }}
+
+#kb-note {{ padding: 0 1; }}
+
+.term-block, .plugin-block, .hook-block {{ width: 1fr; height: 1fr; }}
+
+.defaults-row, .settings-row {{ height: 3; padding: 0 1; }}
+.defaults-row Input, .settings-row Input, .settings-row Select, .settings-row Switch {{ width: 1fr; }}
+.defaults-row Button, .settings-row Button {{ width: 12; }}
+.settings-row Switch {{ background: {p["selection"]}; }}
+
+Footer {{ color: {p["foreground"]}; background: {p["lighter_background"]}; }}
+
+RebindScreen, TmuxRebindScreen, HerdrRebindScreen, NvimRebindScreen, WorkspaceRenameScreen {{
+    align: center middle;
+}}
+#rebind-dialog {{
+    width: 74;
+    height: auto;
+    padding: 1 2;
+    border: thick {p["accent"]};
+    background: {p["dark_background"]};
+}}
+#rebind-dialog Input {{ width: 1fr; margin: 0 0 1 0; }}
+#rebind-dialog Label.kind-label {{ padding: 0; }}
+#rebind-dialog .buttons-row {{ padding: 0; }}
+"""
+
+
+def run(cmd: list[str], timeout: int = 90) -> tuple[str, str, int]:
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return res.stdout, res.stderr, res.returncode
+    except Exception as exc:
+        return "", str(exc), -1
+
+
+def sh(cmd: list[str]) -> str:
+    out, _err, code = run(cmd)
+    return out.strip() if code == 0 else ""
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def write_json(path: Path, data: dict, backup: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if backup and path.exists():
+        bak = path.with_name(f"{path.name}.bak.{int(time.time())}")
+        try:
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+        baks = sorted(
+            path.parent.glob(f"{path.name}.bak.*"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        )
+        for extra in baks[:-5]:
+            try:
+                extra.unlink()
+            except Exception:
+                pass
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def backup(path: Path) -> None:
+    if path.exists():
+        bak = path.with_name(f"{path.name}.bak.{int(time.time())}")
+        try:
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+
+
+def luminance(hexcol: str) -> float:
+    try:
+        r, g, b = (int(hexcol[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    except Exception:
+        return 0.5
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def color_name(hexcol: str) -> str:
+    raw = hexcol.strip().lstrip("#")
+    if len(raw) == 3:
+        raw = "".join(c * 2 for c in raw)
+    try:
+        r, g, b = (int(raw[i : i + 2], 16) / 255 for i in (0, 2, 4))
+    except Exception:
+        return "color"
+    mx, mn = max(r, g, b), min(r, g, b)
+    lit = (mx + mn) / 2
+    if mx == mn:
+        hue, sat = 0.0, 0.0
+    else:
+        d = mx - mn
+        sat = d / (1 - abs(2 * lit - 1)) if lit not in (0, 1) else 0.0
+        if mx == r:
+            hue = ((g - b) / d) % 6
+        elif mx == g:
+            hue = (b - r) / d + 2
+        else:
+            hue = (r - g) / d + 4
+        hue *= 60
+    if sat < 0.12:
+        if lit < 0.08:
+            return "black"
+        if lit < 0.22:
+            return "charcoal"
+        if lit < 0.40:
+            return "gray"
+        if lit < 0.62:
+            return "silver"
+        if lit < 0.92:
+            return "light-gray"
+        return "white"
+    if sat < 0.30:
+        if lit >= 0.80:
+            return "silver"
+        if lit <= 0.20:
+            return "charcoal"
+        if hue < 50 and lit < 0.42:
+            return "brown"
+        if 25 <= hue < 85:
+            return "taupe" if lit > 0.45 else "olive"
+        if 85 <= hue < 165:
+            return "sage"
+        if 165 <= hue < 255:
+            return "slate"
+        if 255 <= hue < 330:
+            return "mauve"
+        return "taupe" if hue < 25 or hue >= 330 else "steel"
+    if lit < 0.18:
+        shade = "dark "
+    elif lit > 0.78:
+        shade = "light "
+    else:
+        shade = ""
+    if hue < 12 or hue >= 348:
+        tone = "peach" if lit > 0.70 else "red"
+    elif hue < 32:
+        tone = "orange"
+    elif hue < 48:
+        tone = "amber"
+    elif hue < 72:
+        tone = "yellow"
+    elif hue < 150:
+        tone = "green"
+    elif hue < 175:
+        tone = "teal"
+    elif hue < 200:
+        tone = "cyan"
+    elif hue < 250:
+        if lit < 0.32:
+            tone = "navy"
+        elif lit > 0.45 and hue < 225:
+            tone = "sky"
+        else:
+            tone = "blue"
+    elif hue < 275:
+        tone = "indigo"
+    elif hue < 310:
+        tone = "purple"
+    elif hue < 335:
+        tone = "magenta"
+    else:
+        tone = "pink"
+    return (shade + tone).strip()
+
+
+def swatch(hexcol: str, label: str | None = None) -> Static:
+    fg = "#000000" if luminance(hexcol) > 0.5 else "#ffffff"
+    chip = Static(f"{label or color_name(hexcol)}  {hexcol}", markup=False, classes="swatch")
+    chip.set_styles(f"background: {hexcol}; color: {fg};")
+    return chip
+
+
+def shell_data() -> dict:
+    return read_json(SHELL_JSON)
+
+
+def cc_data() -> dict:
+    return read_json(CC_JSON)
+
+
+def advanced_mode_pref() -> bool:
+    data = cc_data()
+    if "advanced_mode" in data:
+        return bool(data["advanced_mode"])
+    return bool(shell_data().get("keybindings", {}).get("advanced_mode", False))
+
+
+def set_advanced_mode_pref(value: bool) -> None:
+    data = cc_data()
+    data["advanced_mode"] = bool(value)
+    write_json(CC_JSON, data, backup=True)
+
+
+def theme_dirs() -> list[dict]:
+    result: list[dict] = []
+    seen: set[str] = set()
+
+    for base, user in ((CONFIG_DIR / "themes", True), (Path("/usr/share/omarchy/themes"), False)):
+        if not base.is_dir():
+            continue
+        for d in sorted(base.iterdir()):
+            if d.name.startswith(".") or not d.is_dir() or not (d / "colors.toml").is_file():
+                continue
+            name = d.name
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append({"name": name, "dir": d, "user": user})
+    return result
+
+
+def theme_colors(tdir: Path) -> dict:
+    path = tdir / "colors.toml"
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except Exception:
+        return {}
+
+
+def active_theme() -> str:
+    out = sh(["omarchy", "theme", "current"])
+    return out.splitlines()[0].strip() if out else ""
+
+
+def theme_names_match(a: str, b: str) -> bool:
+    return a.strip().lower().replace(" ", "-") == b.strip().lower()
+
+
+PALETTE = dict(_HOLMES)
+ACCENT = PALETTE["accent"]
+STEEL = PALETTE["dark_foreground"]
+FG = PALETTE["light_foreground"]
+
+
+def slug(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9-]+", "-", str(name)).strip("-")
+    if not s or s[0].isdigit():
+        s = f"x-{s}" if s else "x"
+    return s
+
+
+def plugin_entries() -> list[dict]:
+    entries = []
+    if not PLUGINS_DIR.is_dir():
+        return entries
+    for d in sorted(PLUGINS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        meta = {}
+        mf = d / "manifest.json"
+        if mf.exists():
+            try:
+                meta = json.loads(mf.read_text())
+            except Exception:
+                meta = {}
+        entries.append({"id": d.name, "dir": d, "meta": meta})
+    return entries
+
+
+def plugin_enabled(pid: str) -> bool:
+    data = shell_data()
+    if pid in (data.get("plugins") or []):
+        return True
+    for section in (data.get("bar") or {}).get("layout", {}).values():
+        for w in section or []:
+            if isinstance(w, dict) and w.get("id") == pid:
+                return True
+    return False
+
+
+def hook_entries() -> list[dict]:
+    entries = []
+    if not HOOKS_DIR.is_dir():
+        return entries
+    for d in sorted(HOOKS_DIR.glob("*.d")):
+        for f in sorted(d.iterdir()):
+            if not f.is_file():
+                continue
+            entries.append({"path": f, "event": d.name, "name": f.name, "active": not f.name.endswith(".sample")})
+    return entries
+
+
+def default_value(kind: str) -> str:
+    f = DEFAULTS_DIR / kind
+    try:
+        return f.read_text().strip()
+    except Exception:
+        return ""
+
+
+def build_hypr_rows() -> tuple[tuple[str, str], list, set, bool]:
+    out = sh(["omarchy", "menu", "keybindings", "--print"])
+    rows = []
+    for line in out.splitlines():
+        if "\u2192" not in line:
+            continue
+        key, desc = (p.strip() for p in line.split("\u2192", 1))
+        rows.append([key, desc])
+    overrides = set()
+    defaults_off = False
+    if HYPR_BINDINGS.exists():
+        for line in HYPR_BINDINGS.read_text().splitlines():
+            s = line.strip()
+            if not s or s.startswith("--"):
+                continue
+            if "omarchy_default_bindings = false" in s:
+                defaults_off = True
+            m = re_search(r'o\.bind\(\s*"([^"]+)"', s) or re_search(r'hl\.unbind\(\s*"([^"]+)"', s)
+            if m:
+                overrides.add(m)
+    marked = []
+    for row in rows:
+        if row[0] in overrides:
+            marked.append([row[0], row[1] + "   [user override]"])
+        else:
+            marked.append(row)
+    return ("Key Binding", "Description"), marked, overrides, defaults_off
+
+
+def _hbind_key(line: str) -> Optional[str]:
+    s = line.strip()
+    if not s or s.startswith("--"):
+        return None
+    m = re.search(r"\b(?:o\.bind|hl\.unbind)\(\s*\"([^\"]+)\"", s)
+    return m.group(1) if m else None
+
+
+def hypr_overrides_map() -> dict[str, tuple[str, str]]:
+    overrides = {}
+    if not HYPR_BINDINGS.is_file():
+        return overrides
+    for line in HYPR_BINDINGS.read_text().splitlines():
+        m = re.search(
+            r'o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"((?:[^"\\]|\\.)*)")\s*,\s*"((?:[^"\\]|\\.)*)"',
+            line,
+        )
+        if m:
+            overrides[m.group(1)] = (_unlua_str(m.group(2) or ""), _unlua_str(m.group(3)))
+    return overrides
+
+
+def _unlua_str(s: str) -> str:
+    return s.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _lua_str(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _write_hypr_bindings(body: str) -> None:
+    backup(HYPR_BINDINGS)
+    HYPR_BINDINGS.write_text(body.rstrip() + "\n")
+
+
+def hypr_write_change(old_key: str, new_key: str, description: str, command: str, default_keys: set) -> None:
+    text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
+    lines = []
+    for ln in text.splitlines():
+        key = _hbind_key(ln)
+        if key is not None and key in (old_key, new_key):
+            continue
+        lines.append(ln)
+    kept = "\n".join(lines).rstrip()
+    additions = []
+    if new_key in default_keys:
+        additions.append(f'hl.unbind("{new_key}")')
+    desc = f'"{_lua_str(description)}"' if description else "nil"
+    additions.append(f'o.bind("{new_key}", {desc}, "{_lua_str(command)}")')
+    body = kept + "\n" + "\n".join(additions) if kept else "\n".join(additions)
+    _write_hypr_bindings(body)
+
+
+def hypr_write_unbind(key: str) -> None:
+    text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
+    lines = []
+    for ln in text.splitlines():
+        matched = _hbind_key(ln)
+        if matched is not None and matched == key:
+            continue
+        lines.append(ln)
+    kept = "\n".join(lines).rstrip()
+    body = kept + "\n" + f'hl.unbind("{key}")' if kept else f'hl.unbind("{key}")'
+    _write_hypr_bindings(body)
+
+
+def hypr_write_revert(key: str) -> None:
+    text = HYPR_BINDINGS.read_text() if HYPR_BINDINGS.is_file() else ""
+    lines = []
+    for ln in text.splitlines():
+        matched = _hbind_key(ln)
+        if matched is not None and matched == key:
+            continue
+        lines.append(ln)
+    _write_hypr_bindings("\n".join(lines).rstrip())
+
+
+TMUX_KEY_RE = re.compile(
+    r"^(?:[CMS]-)*(?:F1[0-2]|F[1-9]|Space|Enter|Escape|Up|Down|Left|Right|[!-~])$"
+)
+TMUX_TABLES = ("prefix", "root", "copy-mode-vi")
+
+
+def validate_tmux_key(key: str) -> bool:
+    return bool(key) and bool(TMUX_KEY_RE.fullmatch(key))
+
+
+def _tmux_table(flags: list[str]) -> str:
+    if "-T" in flags:
+        i = flags.index("-T")
+        if i + 1 < len(flags):
+            return flags[i + 1]
+    if "-n" in flags:
+        return "root"
+    return "prefix"
+
+
+def _tmux_flags_for_table(table: str) -> list[str]:
+    if table == "root":
+        return ["-n"]
+    if table and table != "prefix":
+        return ["-T", table]
+    return []
+
+
+def parse_tmux_bind(line: str) -> Optional[dict]:
+    s = line.strip()
+    if not s.startswith("bind "):
+        return None
+    m = re.match(r'bind\s+(?:-N\s+"(?P<desc>[^"]*)"\s+)?(?P<rest>.+)$', s)
+    if not m:
+        return None
+    toks = m.group("rest").split()
+    flags: list[str] = []
+    i = 0
+    while i < len(toks) and toks[i].startswith("-"):
+        if toks[i] in ("-T", "-t", "-b", "-g") and i + 1 < len(toks):
+            flags.extend([toks[i], toks[i + 1]])
+            i += 2
+        else:
+            flags.append(toks[i])
+            i += 1
+    if i >= len(toks):
+        return None
+    desc = (m.group("desc") or "").strip()
+    key = toks[i]
+    cmd = " ".join(toks[i + 1 :])
+    return {
+        "key": key,
+        "desc": desc,
+        "cmd": cmd,
+        "flags": flags,
+        "table": _tmux_table(flags),
+    }
+
+
+def _tmux_bind_line(desc: str, flags: list[str], key: str, cmd: str) -> str:
+    flag_s = (" " + " ".join(flags)) if flags else ""
+    if desc:
+        return f'bind -N "{_lua_str(desc)}"{flag_s} {key} {cmd}'
+    return f"bind{flag_s} {key} {cmd}"
+
+
+def _tmux_drop_keys() -> tuple[bool, list[str]]:
+    if not TMUX_CONF.exists():
+        return False, []
+    return True, TMUX_CONF.read_text().splitlines()
+
+
+def tmux_write_change(old_table: str, old_key: str, new_key: str, desc: str, cmd: str, flags: list[str]) -> bool:
+    ok, lines = _tmux_drop_keys()
+    if not ok:
+        return False
+    backup(TMUX_CONF)
+    table = _tmux_table(flags)
+    new_lines = []
+    for line in lines:
+        parsed = parse_tmux_bind(line)
+        if parsed and (
+            (parsed["table"] == old_table and parsed["key"] == old_key)
+            or (parsed["table"] == table and parsed["key"] == new_key)
+        ):
+            continue
+        new_lines.append(line)
+    new_lines.append(_tmux_bind_line(desc, flags, new_key, cmd))
+    TMUX_CONF.write_text("\n".join(new_lines).rstrip() + "\n")
+    return True
+
+
+def tmux_write_unbind(table: str, key: str) -> bool:
+    ok, lines = _tmux_drop_keys()
+    if not ok:
+        return False
+    backup(TMUX_CONF)
+    new_lines = []
+    for line in lines:
+        parsed = parse_tmux_bind(line)
+        if parsed and parsed["table"] == table and parsed["key"] == key:
+            continue
+        new_lines.append(line)
+    TMUX_CONF.write_text("\n".join(new_lines).rstrip() + "\n")
+    return True
+
+
+def tmux_write_add(key: str, desc: str, cmd: str, table: str = "prefix") -> bool:
+    ok, lines = _tmux_drop_keys()
+    if not ok:
+        return False
+    backup(TMUX_CONF)
+    flags = _tmux_flags_for_table(table)
+    TMUX_CONF.write_text("\n".join(lines).rstrip() + "\n" + _tmux_bind_line(desc, flags, key, cmd) + "\n")
+    return True
+
+
+def parse_herdr_combo(combo: str) -> list[str]:
+    return [c.strip() for c in combo.split(",") if c.strip()]
+
+
+def _toml_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _herdr_toml_value(combo_list: list[str], as_array: bool) -> str:
+    if as_array or len(combo_list) != 1:
+        return "[" + ", ".join(_toml_str(c) for c in combo_list) + "]"
+    return _toml_str(combo_list[0])
+
+
+def herdr_write_change(old_name: str, new_name: str, combo_list: list[str]) -> bool:
+    if not HERDR_CONF.exists():
+        return False
+    lines = HERDR_CONF.read_text().splitlines()
+    in_keys = False
+    new_lines = []
+    found = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[keys]":
+            in_keys = True
+            new_lines.append(line)
+            continue
+        if in_keys and stripped.startswith("["):
+            in_keys = False
+        if in_keys and "=" in line and not stripped.startswith("#"):
+            key_name = line.split("=", 1)[0].strip()
+            rhs = line.split("=", 1)[1]
+            if key_name == old_name:
+                as_array = "[" in rhs or len(combo_list) > 1
+                new_lines.append(f"{new_name} = {_herdr_toml_value(combo_list, as_array)}")
+                found = True
+                continue
+        new_lines.append(line)
+    if not found:
+        return False
+    backup(HERDR_CONF)
+    HERDR_CONF.write_text("\n".join(new_lines).rstrip() + "\n")
+    return True
+
+
+def herdr_write_unbind(name: str) -> bool:
+    if not HERDR_CONF.exists():
+        return False
+    backup(HERDR_CONF)
+    lines = HERDR_CONF.read_text().splitlines()
+    in_keys = False
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[keys]":
+            in_keys = True
+            new_lines.append(line)
+            continue
+        if in_keys and stripped.startswith("["):
+            in_keys = False
+        if in_keys and "=" in line and not stripped.startswith("#"):
+            if line.split("=", 1)[0].strip() == name:
+                continue
+        new_lines.append(line)
+    HERDR_CONF.write_text("\n".join(new_lines).rstrip() + "\n")
+    return True
+
+
+def herdr_write_add(name: str, combo_list: list[str]) -> bool:
+    if not HERDR_CONF.exists():
+        return False
+    backup(HERDR_CONF)
+    lines = HERDR_CONF.read_text().splitlines()
+    in_keys = False
+    new_lines = []
+    added = False
+    entry = f"{name} = {_herdr_toml_value(combo_list, len(combo_list) > 1)}"
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[keys]":
+            in_keys = True
+            new_lines.append(line)
+            continue
+        if in_keys and stripped.startswith("[") and not added:
+            new_lines.append(entry)
+            added = True
+        new_lines.append(line)
+    if not added:
+        new_lines.append(entry)
+    HERDR_CONF.write_text("\n".join(new_lines).rstrip() + "\n")
+    return True
+
+
+NVIM_MODES = ["n", "v", "i", "x", "s", "o", "t", "c"]
+NVIM_SET_RE = re.compile(
+    r'vim\.keymap\.set\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*,\s*["\'](.*?)["\']'
+)
+
+
+def validate_nvim_mode(mode: str) -> bool:
+    return mode in NVIM_MODES
+
+
+def _nvim_map_line(mode: str, key: str, cmd: str, desc: str) -> str:
+    desc_part = f', {{ desc = "{_lua_str(desc)}" }}' if desc else ""
+    return f'vim.keymap.set("{_lua_str(mode)}", "{_lua_str(key)}", "{_lua_str(cmd)}"{desc_part})'
+
+
+def nvim_write_change(old_mode: str, old_key: str, new_mode: str, new_key: str, cmd: str, desc: str) -> bool:
+    if not NVIM_KEYMAPS.exists():
+        return False
+    backup(NVIM_KEYMAPS)
+    new_lines = []
+    found = False
+    for line in NVIM_KEYMAPS.read_text().splitlines():
+        m = NVIM_SET_RE.search(line)
+        if m and m.group(1) == old_mode and m.group(2) == old_key:
+            new_lines.append(_nvim_map_line(new_mode, new_key, cmd, desc))
+            found = True
+            continue
+        new_lines.append(line)
+    NVIM_KEYMAPS.write_text("\n".join(new_lines).rstrip() + "\n")
+    return found
+
+
+def nvim_write_unbind(mode: str, key: str) -> bool:
+    if not NVIM_KEYMAPS.exists():
+        return False
+    backup(NVIM_KEYMAPS)
+    new_lines = []
+    for line in NVIM_KEYMAPS.read_text().splitlines():
+        m = NVIM_SET_RE.search(line)
+        if m and m.group(1) == mode and m.group(2) == key:
+            continue
+        new_lines.append(line)
+    NVIM_KEYMAPS.write_text("\n".join(new_lines).rstrip() + "\n")
+    return True
+
+
+def nvim_write_add(mode: str, key: str, cmd: str, desc: str) -> bool:
+    NVIM_KEYMAPS.parent.mkdir(parents=True, exist_ok=True)
+    if NVIM_KEYMAPS.exists():
+        backup(NVIM_KEYMAPS)
+        existing = NVIM_KEYMAPS.read_text()
+    else:
+        existing = "-- Add any additional keymaps here\n"
+    NVIM_KEYMAPS.write_text(existing.rstrip() + "\n" + _nvim_map_line(mode, key, cmd, desc) + "\n")
+    return True
+
+
+def re_search(pattern: str, text: str) -> Optional[str]:
+    m = re.search(pattern, text)
+    return m.group(1) if m else None
+
+
+def build_tmux_rows() -> list:
+    if not TMUX_CONF.exists():
+        return []
+    rows = []
+    for line in TMUX_CONF.read_text().splitlines():
+        parsed = parse_tmux_bind(line)
+        if not parsed:
+            continue
+        desc = parsed["desc"] or parsed["cmd"]
+        rows.append([parsed["table"], parsed["key"], desc, parsed["cmd"], parsed["flags"]])
+    return rows
+
+
+def build_herdr_rows() -> list:
+    if not HERDR_CONF.exists():
+        return []
+    try:
+        data = tomllib.loads(HERDR_CONF.read_text())
+    except Exception:
+        return []
+    rows = []
+    for name, val in (data.get("keys") or {}).items():
+        if isinstance(val, list):
+            combo = ", ".join(val)
+        else:
+            combo = str(val)
+        rows.append([name, combo])
+    return rows
+
+
+def build_nvim_rows() -> list:
+    if not NVIM_KEYMAPS.exists():
+        return []
+    rows = []
+    for line in NVIM_KEYMAPS.read_text().splitlines():
+        m = re.search(
+            r'vim\.keymap\.set\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*,\s*["\'](.*?)["\']', line
+        )
+        if not m:
+            continue
+        mode, key, cmd = m.groups()
+        dm = re.search(r'desc\s*=\s*["\']([^"\']+)["\']', line)
+        purpose = dm.group(1) if dm else cmd
+        rows.append([mode, key, cmd, purpose])
+    return rows
+
+
+def get_wallpaper_backgrounds() -> list[dict]:
+    backgrounds = []
+    current = sh(["omarchy", "theme", "bg", "current"])
+    wp_dir = get_wallpaper_dir()
+    if not wp_dir.is_dir():
+        return backgrounds
+    for f in sorted(wp_dir.iterdir()):
+        if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            stem = f.stem
+            name = re.sub(r'^\d+[-_\s]+', '', stem)
+            is_current = current and name.lower().replace("-", " ").replace("_", " ") in current.lower().replace("-", " ").replace("_", " ")
+            backgrounds.append({"name": name, "path": f, "current": is_current})
+    return backgrounds
+
+
+def set_wallpaper(path: str) -> tuple[str, str, int]:
+    return run(["omarchy", "theme", "bg", "set", path])
+
+
+def next_wallpaper() -> tuple[str, str, int]:
+    return run(["omarchy", "theme", "bg", "next"])
+
+
+def get_hypr_workspaces() -> list[dict]:
+    out = sh(["hyprctl", "workspaces", "-j"])
+    if not out:
+        return []
+    try:
+        workspaces = json.loads(out)
+        return sorted(workspaces, key=lambda w: w.get("id", 0))
+    except Exception:
+        return []
+
+
+def load_workspace_names() -> dict[int, str]:
+    if not WORKSPACE_CONFIG.is_file():
+        return {}
+    try:
+        content = WORKSPACE_CONFIG.read_text()
+        names = {}
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("workspace = "):
+                parts = line[len("workspace = "):].split(",")
+                if len(parts) >= 2:
+                    ws_id = int(parts[0].strip())
+                    name_part = parts[1].strip()
+                    if name_part.startswith("name:"):
+                        name = name_part[5:].strip().strip('"\'')
+                        names[ws_id] = name
+        return names
+    except Exception:
+        return {}
+
+
+def save_workspace_names(names: dict[int, str]) -> None:
+    WORKSPACE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["-- Workspace names managed by Omarchy Command Center", ""]
+    for ws_id in sorted(names.keys()):
+        name = names[ws_id]
+        if name:
+            lines.append(f'workspace = {ws_id}, name: "{name}"')
+    content = "\n".join(lines) + "\n"
+    backup(WORKSPACE_CONFIG)
+    WORKSPACE_CONFIG.write_text(content)
+
+
+def _omarchy_username() -> str:
+    return os.environ.get("USER") or getpass.getuser()
+
+
+def get_cloned_workspaces_plugin_dir() -> Path | None:
+    """Return this user's cloned workspaces plugin (`$USER.workspaces`), if any."""
+    if not PLUGINS_DIR.is_dir():
+        return None
+    preferred = PLUGINS_DIR / f"{_omarchy_username()}.workspaces"
+    if preferred.is_dir():
+        return preferred
+    matches = []
+    for d in PLUGINS_DIR.iterdir():
+        if not d.is_dir() or not d.name.endswith(".workspaces"):
+            continue
+        cloned_from = ""
+        manifest = d / "manifest.json"
+        if manifest.is_file():
+            try:
+                cloned_from = str((json.loads(manifest.read_text()).get("omarchy") or {}).get("clonedFrom") or "")
+            except Exception:
+                cloned_from = ""
+        if cloned_from == "omarchy.workspaces" or d.name.endswith(".workspaces"):
+            matches.append(d)
+    return sorted(matches, key=lambda p: p.name)[0] if matches else None
+
+
+def _bar_has_widget(widget_id: str) -> bool:
+    layout = (shell_data().get("bar") or {}).get("layout") or {}
+    for section in layout.values():
+        if not isinstance(section, list):
+            continue
+        for item in section:
+            if item == widget_id:
+                return True
+            if isinstance(item, dict) and item.get("id") == widget_id:
+                return True
+    return False
+
+
+def ensure_named_workspaces_on_bar() -> tuple[bool, str]:
+    """Put the cloned workspaces widget on the bar. Do not re-clone if it exists."""
+    plugin_dir = get_cloned_workspaces_plugin_dir()
+    if plugin_dir:
+        install_workspace_names_loader(plugin_dir)
+        if _bar_has_widget(plugin_dir.name):
+            return True, plugin_dir.name
+        _out, err, code = run(["omarchy", "plugin", "enable", plugin_dir.name])
+        if code != 0:
+            return False, (err or _out).strip() or f"could not enable {plugin_dir.name}"
+        return True, plugin_dir.name
+    _out, err, code = run(["omarchy", "plugin", "clone", "omarchy.workspaces"])
+    if code != 0:
+        return False, (err or _out).strip() or "clone failed"
+    plugin_dir = get_cloned_workspaces_plugin_dir()
+    if not plugin_dir:
+        return False, "clone did not create a workspaces plugin"
+    return True, plugin_dir.name
+
+
+def _qml_name_pairs(text: str) -> dict[int, str]:
+    labels: dict[int, str] = {}
+    for match in re.finditer(r'(\d+)\s*:\s*"((?:[^"\\]|\\.)*)"', text):
+        ws_id = int(match.group(1))
+        if 1 <= ws_id <= WORKSPACE_SLOT_COUNT:
+            labels[ws_id] = match.group(2).replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+    return labels
+
+
+def _default_workspace_labels() -> dict[int, str]:
+    return {i: str(i) for i in range(1, WORKSPACE_SLOT_COUNT + 1)}
+
+
+def load_workspace_labels_from_plugin() -> dict[int, str]:
+    labels = _default_workspace_labels()
+    data = read_json(WORKSPACE_NAMES_JSON)
+    if data:
+        for key, value in data.items():
+            try:
+                ws_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            name = str(value).replace("\\", "").strip()
+            if 1 <= ws_id <= WORKSPACE_SLOT_COUNT and name:
+                labels[ws_id] = name
+        return labels
+    plugin_dir = get_cloned_workspaces_plugin_dir()
+    if not plugin_dir:
+        return labels
+    qml_file = plugin_dir / "Workspaces.qml"
+    if not qml_file.is_file():
+        return labels
+    content = qml_file.read_text()
+    block = None
+    named = re.search(r"property var workspaceNames:\s*\(\{(.*?)\}\)", content, flags=re.S)
+    if named:
+        block = named.group(1)
+    else:
+        bay = re.search(r"function bayLabel\s*\([^)]*\)\s*\{(.*?)return labels", content, flags=re.S)
+        if bay:
+            block = bay.group(1)
+    if block:
+        for ws_id, name in _qml_name_pairs(block).items():
+            labels[ws_id] = name.replace("\\", "").strip() or str(ws_id)
+    return labels
+
+
+OCC_NAMES_BEGIN = "// OCC-NAMES-BEGIN"
+OCC_NAMES_END = "// OCC-NAMES-END"
+
+
+def _names_qml_block(labels: dict[int, str]) -> str:
+    merged = {i: str(i) for i in range(1, WORKSPACE_SLOT_COUNT + 1)}
+    for key, value in labels.items():
+        ws_id = int(key)
+        name = str(value).replace("\\", "").replace('"', "").strip()
+        if 1 <= ws_id <= WORKSPACE_SLOT_COUNT and name:
+            merged[ws_id] = name
+    lines = [OCC_NAMES_BEGIN, "  property var workspaceNames: ({"]
+    for ws_id in range(1, WORKSPACE_SLOT_COUNT + 1):
+        lines.append(f'    {ws_id}: "{merged[ws_id]}",')
+    lines.append("  })")
+    lines.append(OCC_NAMES_END)
+    return "\n".join(lines)
+
+
+def save_workspace_labels_to_plugin(labels: dict[int, str]) -> bool:
+    merged = load_workspace_labels_from_plugin()
+    for key, value in labels.items():
+        ws_id = int(key)
+        name = str(value).replace("\\", "").replace('"', "").strip()
+        if 1 <= ws_id <= WORKSPACE_SLOT_COUNT and name:
+            merged[ws_id] = name
+    payload = {str(i): merged[i] for i in range(1, WORKSPACE_SLOT_COUNT + 1)}
+    WORKSPACE_NAMES_JSON.parent.mkdir(parents=True, exist_ok=True)
+    WORKSPACE_NAMES_JSON.write_text(json.dumps(payload, indent=2) + "\n")
+    plugin_dir = get_cloned_workspaces_plugin_dir()
+    if not plugin_dir:
+        return True
+    qml_file = plugin_dir / "Workspaces.qml"
+    if not qml_file.is_file():
+        return False
+    text = qml_file.read_text()
+    block = _names_qml_block(merged)
+    start = text.find(OCC_NAMES_BEGIN)
+    end = text.find(OCC_NAMES_END)
+    if start >= 0 and end > start:
+        text = text[:start] + block + text[end + len(OCC_NAMES_END) :]
+    else:
+        needle = "moduleName:"
+        at = text.find(needle)
+        nl = text.find("\n", at if at >= 0 else 0)
+        if nl < 0:
+            return False
+        text = text[: nl + 1] + "\n" + block + "\n" + text[nl + 1 :]
+    qml_file.write_text(text if text.endswith("\n") else text + "\n")
+    # Omarchy #8555: Local plugin changed re-registers the widget but
+    # Qt.clearComponentCache is not in Quickshell, so the bar keeps the old
+    # compiled QML until the shell process restarts.
+    run(["omarchy", "restart", "shell"])
+    return True
+
+
+def install_workspace_names_loader(plugin_dir: Path) -> bool:
+    qml_file = plugin_dir / "Workspaces.qml"
+    if qml_file.is_file() and "workspace-names.json" in qml_file.read_text():
+        return True
+    if qml_file.is_file():
+        backup(qml_file)
+    qml_file.write_text(WORKSPACES_QML_TEMPLATE.replace("__MODULE__", plugin_dir.name))
+    run(["omarchy-shell", "shell", "rescanPlugins"])
+    return True
+
+
+WORKSPACES_QML_TEMPLATE = r'''import QtQuick
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Io
+import Quickshell.Hyprland
+import qs.Commons
+import qs.Ui
+
+BarWidget {
+  id: root
+  moduleName: "__MODULE__"
+
+  property int namesRev: 0
+  property var workspaceNames: ({
+    1: "1", 2: "2", 3: "3", 4: "4", 5: "5",
+    6: "6", 7: "7", 8: "8", 9: "9", 10: "10"
+  })
+
+  function applyNames(text) {
+    try {
+      var data = JSON.parse(text)
+      var next = {}
+      for (var i = 1; i <= 10; i++) {
+        var raw = data[String(i)]
+        if (raw === undefined) raw = data[i]
+        next[i] = (raw !== undefined && String(raw).length) ? String(raw) : String(i)
+      }
+      root.workspaceNames = next
+      root.namesRev = root.namesRev + 1
+    } catch (e) {
+    }
+  }
+
+  function workspaceById(id) {
+    var values = Hyprland.workspaces.values
+    for (var i = 0; i < values.length; i++) {
+      if (values[i].id === id) return values[i]
+    }
+    return null
+  }
+
+  function workspaceIds() {
+    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  }
+
+  function focusWorkspace(id) {
+    if (!root.bar) return
+    root.bar.run("hyprctl dispatch " + Util.shellQuote("hl.dsp.focus({ workspace = " + id + " })"))
+  }
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.config/omarchy/workspace-names.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyNames(text())
+    onFileChanged: reload()
+  }
+
+  readonly property real trailingGap: root.vertical ? 0 : Style.spaceReal(1.5)
+  implicitWidth: grid.implicitWidth + trailingGap
+  implicitHeight: grid.implicitHeight
+
+  GridLayout {
+    id: grid
+    anchors.fill: parent
+    anchors.rightMargin: root.trailingGap
+    columns: root.vertical ? 1 : root.workspaceIds().length
+    columnSpacing: root.vertical ? 0 : Style.space(1)
+    rowSpacing: root.vertical ? Style.space(2) : 0
+
+    Repeater {
+      model: root.workspaceIds()
+      WidgetButton {
+        required property int modelData
+        readonly property var workspace: root.workspaceById(modelData)
+        readonly property bool occupied: workspace !== null && workspace.toplevels.values.length > 0
+        readonly property bool focused: Hyprland.focusedWorkspace !== null && Hyprland.focusedWorkspace.id === modelData
+        bar: root.bar
+        text: root.namesRev >= 0 ? (root.workspaceNames[modelData] || String(modelData)) : ""
+        opacity: occupied || focused ? 1 : 0.5
+        horizontalMargin: 6
+        verticalPadding: 6
+        fixedWidth: root.vertical ? root.barSize : 0
+        fixedHeight: root.barSize
+        onPressed: function() { root.focusWorkspace(modelData) }
+      }
+    }
+  }
+}
+'''
+
+
+def hypr_option(name: str):
+    raw = sh(["hyprctl", "getoption", name, "-j"])
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if "str" in data:
+        value = data["str"]
+        return "" if value == "[[EMPTY]]" else value
+    if "int" in data:
+        return int(data["int"])
+    if "float" in data:
+        return float(data["float"])
+    if "bool" in data:
+        return bool(data["bool"])
+    return None
+
+
+def read_input_settings() -> dict:
+    accel = hypr_option("input:accel_profile") or "adaptive"
+    if accel in ("", "[[EMPTY]]"):
+        accel = "adaptive"
+    return {
+        "sensitivity": hypr_option("input:sensitivity") if hypr_option("input:sensitivity") is not None else 0.0,
+        "accel_profile": accel,
+        "follow_mouse": hypr_option("input:follow_mouse") if hypr_option("input:follow_mouse") is not None else 1,
+        "kb_layout": hypr_option("input:kb_layout") or "us",
+        "kb_variant": hypr_option("input:kb_variant") or "",
+        "kb_options": hypr_option("input:kb_options") or "compose:caps,shift:both_capslock_cancel",
+        "repeat_rate": hypr_option("input:repeat_rate") if hypr_option("input:repeat_rate") is not None else 40,
+        "repeat_delay": hypr_option("input:repeat_delay") if hypr_option("input:repeat_delay") is not None else 250,
+        "numlock_by_default": bool(hypr_option("input:numlock_by_default")),
+        "natural_scroll": bool(hypr_option("input:touchpad:natural_scroll")),
+        "clickfinger_behavior": bool(hypr_option("input:touchpad:clickfinger_behavior") if hypr_option("input:touchpad:clickfinger_behavior") is not None else True),
+        "scroll_factor": hypr_option("input:touchpad:scroll_factor") if hypr_option("input:touchpad:scroll_factor") is not None else 0.4,
+        "disable_while_typing": bool(hypr_option("input:touchpad:disable_while_typing") if hypr_option("input:touchpad:disable_while_typing") is not None else True),
+    }
+
+
+def write_input_settings(settings: dict) -> tuple[bool, str]:
+    def lua_bool(value: bool) -> str:
+        return "true" if value else "false"
+
+    def lua_num(value) -> str:
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    block = "\n".join(
+        [
+            OCC_INPUT_BEGIN,
+            "hl.config({",
+            "  input = {",
+            f'    kb_layout = "{_lua_str(str(settings["kb_layout"]))}",',
+            f'    kb_variant = "{_lua_str(str(settings["kb_variant"]))}",',
+            f'    kb_options = "{_lua_str(str(settings["kb_options"]))}",',
+            f"    repeat_rate = {lua_num(settings['repeat_rate'])},",
+            f"    repeat_delay = {lua_num(settings['repeat_delay'])},",
+            f"    numlock_by_default = {lua_bool(bool(settings['numlock_by_default']))},",
+            f"    follow_mouse = {int(settings['follow_mouse'])},",
+            f"    sensitivity = {lua_num(settings['sensitivity'])},",
+            f'    accel_profile = "{_lua_str(str(settings["accel_profile"]))}",',
+            "    touchpad = {",
+            f"      natural_scroll = {lua_bool(bool(settings['natural_scroll']))},",
+            f"      clickfinger_behavior = {lua_bool(bool(settings['clickfinger_behavior']))},",
+            f"      scroll_factor = {lua_num(settings['scroll_factor'])},",
+            f"      disable_while_typing = {lua_bool(bool(settings['disable_while_typing']))},",
+            "    },",
+            "  },",
+            "})",
+            OCC_INPUT_END,
+            "",
+        ]
+    )
+    existing = HYPR_INPUT.read_text() if HYPR_INPUT.is_file() else ""
+    if OCC_INPUT_BEGIN in existing and OCC_INPUT_END in existing:
+        body = re.sub(
+            re.escape(OCC_INPUT_BEGIN) + r".*?" + re.escape(OCC_INPUT_END),
+            block.rstrip(),
+            existing,
+            count=1,
+            flags=re.S,
+        )
+    else:
+        body = existing.rstrip() + "\n\n" + block
+    backup(HYPR_INPUT)
+    HYPR_INPUT.write_text(body if body.endswith("\n") else body + "\n")
+    _out, err, code = run(["hyprctl", "reload"])
+    if code != 0:
+        return False, err.strip() or "hyprctl reload failed"
+    errors = sh(["hyprctl", "configerrors"])
+    if errors and errors.strip() not in ("", "ok", "[]"):
+        return False, errors.strip()
+    return True, "applied"
+
+
+class DashboardView(VerticalScroll):
+    def compose(self) -> ComposeResult:
+        yield Static("", id="dash-stats", classes="stat")
+        yield Horizontal(
+            Vertical(
+                Label("Plugins", classes="section-title"),
+                OptionList(id="dash-plugins"),
+            ),
+            Vertical(
+                Label("Hooks", classes="section-title"),
+                OptionList(id="dash-hooks"),
+            ),
+            classes="pads",
+        )
+        yield Horizontal(Button("Refresh", id="dash-refresh", variant="primary"), classes="buttons-row")
+
+    @on(Button.Pressed, "#dash-refresh")
+    def _refresh_clicked(self) -> None:
+        self.refresh_view()
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        self.notify("Refreshing dashboard…", timeout=2)
+        version = sh(["omarchy", "version"]) or "unknown"
+        theme = active_theme() or "unknown"
+        bg = sh(["omarchy", "theme", "bg", "current"]) or "–"
+        check = sh(["omarchy", "commands", "--check"])
+        if not check:
+            check_status = "unavailable"
+        elif "failed" in check.lower():
+            check_status = check.splitlines()[0].strip()[:30]
+        else:
+            check_status = "OK"
+
+        data = shell_data()
+        bar = data.get("bar") or {}
+        layout = bar.get("layout") or {}
+        idle = data.get("idle") or {}
+        position = bar.get("position", "top")
+        transparent = "yes" if bar.get("transparent") else "no"
+        anchor = bar.get("centerAnchor", "–")
+        lock = idle.get("lock", "–")
+        ssaver = idle.get("screensaver", "–")
+
+        themes = theme_dirs()
+        user_count = sum(1 for t in themes if t["user"])
+        builtin_count = len(themes) - user_count
+        plugins = plugin_entries()
+        hooks = hook_entries()
+        active_hooks = sum(1 for h in hooks if h["active"])
+
+        defaults = [f"{k}={default_value(k) or '–'}" for k in DEFAULTS]
+        hook_summary = f"{active_hooks} active · {len(hooks) - active_hooks} samples" if hooks else "none"
+
+        commands = [
+            ("Version", version),
+            ("Active theme", theme),
+            ("Background", bg),
+            ("Bar position", position),
+            ("Bar transparent", transparent),
+            ("Clock anchor", anchor),
+            ("Idle lock / screensaver", f"{lock}s / {ssaver}s"),
+            ("Default agent", default_value("agent") or "–"),
+            ("Defaults", ", ".join(defaults)),
+            ("Themes", f"{user_count} user · {builtin_count} built-in"),
+            ("Plugins", f"{len(plugins)} installed · {sum(plugin_enabled(p['id']) for p in plugins)} enabled"),
+            ("Hooks", hook_summary),
+            ("Commands check", check_status),
+        ]
+        lines = [f"[b {PALETTE['accent']}]OMARCHY SYSTEM[/]", ""]
+        for label, value in commands:
+            lines.append(f"[b {PALETTE['muted']}]{label:<24}[/] {value}")
+        self.query_one("#dash-stats", Static).update("\n".join(lines))
+
+        plist = self.query_one("#dash-plugins", OptionList)
+        plist.clear_options()
+        plist.add_options(
+            [
+                Option(("● " if plugin_enabled(p["id"]) else "○ ") + p["id"], id=f"dp-{slug(p['id'])}")
+                for p in plugins
+            ]
+        )
+        hlist = self.query_one("#dash-hooks", OptionList)
+        hlist.clear_options()
+        hlist.add_options(
+            [
+                Option(
+                    ("● " if h["active"] else "○ ") + f"{h['event']}/{h['name']}",
+                    id=f"dh-{slug(h['event'])}-{slug(h['name'])}",
+                )
+                for h in hooks
+            ]
+        )
+
+
+class ThemesView(Vertical):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.themes: list[dict] = []
+        self.current = ""
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            with Vertical(id="themes-col-left", classes="col"):
+                yield Label("Themes — Enter to apply", classes="section-title")
+                yield OptionList(id="theme-list")
+            with Vertical(id="themes-col-right", classes="col"):
+                yield Label("Preview", classes="section-title")
+                yield Static("", id="theme-name", classes="stat")
+                yield Static("", id="theme-path", classes="hint")
+                yield Vertical(id="theme-core", classes="swatch-box")
+                yield Vertical(id="theme-palette", classes="swatch-box")
+                yield Horizontal(
+                    Button("Apply theme", id="theme-apply", variant="primary"),
+                    Button("Refresh", id="theme-refresh"),
+                    classes="buttons-row",
+                )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#theme-refresh")
+    def _refresh_clicked(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#theme-apply")
+    def _apply_clicked(self) -> None:
+        ol = self.query_one("#theme-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not self.themes:
+            self.notify("Select a theme first", severity="warning")
+            return
+        name = self.themes[idx]["name"]
+        self.notify(f"Applying theme {name}…", timeout=5)
+        out, err, code = run(["omarchy", "theme", "set", name])
+        if code == 0:
+            self.notify(f"Theme applied: {name}")
+            self.app._apply_theme_css()
+        else:
+            self.notify(f"Failed to apply theme: {err.strip() or out.strip()}", severity="error")
+        self.refresh_view()
+
+    @on(OptionList.OptionHighlighted, "#theme-list")
+    def _highlighted(self, ev: OptionList.OptionHighlighted) -> None:
+        self._preview(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.current = active_theme()
+        self.themes = theme_dirs()
+        ol = self.query_one("#theme-list", OptionList)
+        ol.clear_options()
+        opts = []
+        active_idx = 0
+        for i, t in enumerate(self.themes):
+            marker = "● " if theme_names_match(self.current, t["name"]) else "○ "
+            label = marker + t["name"]
+            if not t["user"]:
+                label += "  (built-in)"
+            opts.append(Option(label, id=f"th-{slug(t['name'])}"))
+            if theme_names_match(self.current, t["name"]):
+                active_idx = i
+        ol.add_options(opts)
+        if self.themes:
+            try:
+                ol.highlighted = active_idx
+            except Exception:
+                pass
+            self._preview(active_idx)
+
+    def _preview(self, idx: int) -> None:
+        if idx is None or not self.themes or not (0 <= idx < len(self.themes)):
+            return
+        t = self.themes[idx]
+        name = t["name"]
+        origin = "user" if t["user"] else "built-in"
+        self.query_one("#theme-name", Static).update(f"[b {ACCENT}]{name}[/]  [i]{origin}[/]")
+        self.query_one("#theme-path", Static).update(f"{t['dir']}")
+        colors = theme_colors(t["dir"])
+        core_keys = ("background", "foreground", "accent", "selection", "active_border_color")
+        if not colors:
+            self._fill_swatch_rows("#theme-core", [])
+            self.query_one("#theme-core").mount(Static(f"[{STEEL}]no colors.toml palette[/]", classes="hint"))
+            self._fill_swatch_rows("#theme-palette", [])
+            return
+        self._fill_swatch_rows(
+            "#theme-core",
+            self._pairs([(k, colors[k]) for k in core_keys if self._is_hex(colors.get(k))]),
+            roles=True,
+        )
+        self._fill_swatch_rows("#theme-palette", self._ansi_rows(colors))
+
+    @staticmethod
+    def _is_hex(val: object) -> bool:
+        return isinstance(val, str) and val.startswith("#") and len(val) >= 4
+
+    @staticmethod
+    def _pairs(items: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+        return [items[i : i + 2] for i in range(0, len(items), 2)]
+
+    def _ansi_rows(self, colors: dict) -> list[list[tuple[str, str]]]:
+        rows: list[list[tuple[str, str]]] = []
+        for base in ("red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"):
+            row: list[tuple[str, str]] = []
+            if self._is_hex(colors.get(base)):
+                row.append((base, colors[base]))
+            bright = f"bright_{base}"
+            if self._is_hex(colors.get(bright)):
+                row.append((bright, colors[bright]))
+            if row:
+                rows.append(row)
+        return rows
+
+    def _fill_swatch_rows(self, widget_id: str, rows: list[list[tuple[str, str]]], *, roles: bool = False) -> None:
+        box = self.query_one(widget_id)
+        box.remove_children()
+        for row in rows:
+            chips = [swatch(val, name if roles else None) for name, val in row]
+            if chips:
+                box.mount(Horizontal(*chips, classes="swatch-row"))
+
+
+class BarView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sections = {"left": [], "center": [], "right": []}
+        self.position = "top"
+        self.transparent = False
+        self.anchor = ""
+        self.lock = 0
+        self.ssaver = 0
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            for sec in ("left", "center", "right"):
+                yield Vertical(
+                    Label(sec.upper() + " SECTION", classes="section-title"),
+                    OptionList(id=f"bar-{sec}"),
+                    classes="col",
+                )
+        yield Horizontal(
+            Button("▲ Up", id="btn-up"),
+            Button("▼ Down", id="btn-down"),
+            Button("◀ To prev", id="btn-prev"),
+            Button("▶ To next", id="btn-next"),
+            Button("Remove", id="btn-remove"),
+            Button("Add custom", id="btn-add"),
+            classes="buttons-row",
+        )
+        yield Horizontal(
+            Input(id="bar-add-input", placeholder="widget id e.g. omarchy.spacer"),
+            classes="pads",
+        )
+        for label, control in (
+            ("Position", Select(
+                [(l, v) for v, l in (("top", "Top"), ("bottom", "Bottom"), ("left", "Left"), ("right", "Right"))],
+                id="bar-pos",
+            )),
+            ("Transparent", Switch(id="bar-trans")),
+            ("Clock anchor", Input(id="bar-anchor", placeholder="e.g. omarchy.clock")),
+            ("Lock idle (s)", Input(id="bar-lock")),
+            ("Screensaver (s)", Input(id="bar-ssaver")),
+        ):
+            with Horizontal(classes="settings-row"):
+                yield Label(label, classes="kind-label")
+                yield control
+        yield Horizontal(
+            Button("Save & apply", id="btn-save", variant="primary"),
+            Button("Reset from disk", id="btn-reset"),
+            classes="buttons-row",
+        )
+
+    def on_mount(self) -> None:
+        self.load()
+
+    @on(Button.Pressed, "#btn-reset")
+    def _reset(self) -> None:
+        self.load()
+        self.notify("Bar config reloaded from disk")
+
+    @on(Button.Pressed, "#btn-up")
+    def _up(self) -> None:
+        self._move_selected(-1)
+
+    @on(Button.Pressed, "#btn-down")
+    def _down(self) -> None:
+        self._move_selected(1)
+
+    @on(Button.Pressed, "#btn-prev")
+    def _to_prev(self) -> None:
+        self._hop(-1)
+
+    @on(Button.Pressed, "#btn-next")
+    def _to_next(self) -> None:
+        self._hop(1)
+
+    @on(Button.Pressed, "#btn-remove")
+    def _remove(self) -> None:
+        sec = self._cur_section()
+        ol = self.query_one(f"#bar-{sec}", OptionList)
+        hl = ol.highlighted
+        if hl is None or not (0 <= hl < len(self.sections[sec])):
+            return
+        removed = self.sections[sec].pop(hl)
+        self._rerender(hl, sec)
+        self.notify(f"Removed {removed.get('id', removed) if isinstance(removed, dict) else removed}")
+
+    @on(Button.Pressed, "#btn-add")
+    def _add_custom(self) -> None:
+        inp = self.query_one("#bar-add-input", Input)
+        wid = inp.value.strip()
+        if not wid:
+            self.notify("Enter a widget id first", severity="warning")
+            return
+        sec = self._cur_section()
+        self.sections[sec].append({"id": wid})
+        inp.value = ""
+        self._rerender(len(self.sections[sec]) - 1, sec)
+        self.notify(f"Added {wid} to {sec}")
+
+    @on(Button.Pressed, "#btn-save")
+    def _save(self) -> None:
+        self._read_settings_inputs()
+        data = shell_data()
+        bar = data.setdefault("bar", {})
+        layout = {}
+        for k, widgets in self.sections.items():
+            items = []
+            for w in widgets:
+                if isinstance(w, dict):
+                    item = dict(w)
+                    if "id" not in item:
+                        item["id"] = str(w)
+                    items.append(item)
+                else:
+                    items.append({"id": str(w)})
+            layout[k] = items
+        bar["layout"] = layout
+        bar["position"] = self.position
+        bar["transparent"] = self.transparent
+        bar["centerAnchor"] = self.anchor
+        data.setdefault("idle", {})
+        data["idle"]["lock"] = int(self.lock or 0)
+        data["idle"]["screensaver"] = int(self.ssaver or 0)
+        write_json(SHELL_JSON, data, backup=True)
+        errors = []
+        for cmd in (
+            ["omarchy", "bar", "position", self.position],
+            ["omarchy", "bar", "transparent", "true" if self.transparent else "false"],
+        ):
+            out, err, code = run(cmd)
+            if code != 0:
+                errors.append((err or out).strip() or " ".join(cmd))
+        if errors:
+            self.notify(errors[0], severity="error")
+            return
+        self.notify("Bar config saved and applied")
+
+    def load(self) -> None:
+        data = shell_data()
+        bar = data.get("bar") or {}
+        layout = bar.get("layout") or {}
+        for sec in self.sections:
+            entries = layout.get(sec) or []
+            self.sections[sec] = [
+                dict(w) if isinstance(w, dict) else {"id": str(w)} for w in entries
+            ]
+        self.position = bar.get("position", "top")
+        self.transparent = bool(bar.get("transparent", False))
+        self.anchor = bar.get("centerAnchor", "")
+        idle = data.get("idle") or {}
+        self.lock = idle.get("lock") or 0
+        self.ssaver = idle.get("screensaver") or 0
+        self._sync_settings_inputs()
+        self._rerender(0)
+
+    def _sync_settings_inputs(self) -> None:
+        try:
+            self.query_one("#bar-pos", Select).value = self.position
+        except Exception:
+            pass
+        self.query_one("#bar-trans", Switch).value = self.transparent
+        self.query_one("#bar-anchor", Input).value = self.anchor
+        self.query_one("#bar-lock", Input).value = str(self.lock)
+        self.query_one("#bar-ssaver", Input).value = str(self.ssaver)
+
+    def _read_settings_inputs(self) -> None:
+        try:
+            self.position = str(self.query_one("#bar-pos", Select).value)
+        except Exception:
+            pass
+        self.transparent = bool(self.query_one("#bar-trans", Switch).value)
+        self.anchor = self.query_one("#bar-anchor", Input).value.strip()
+        try:
+            self.lock = int(self.query_one("#bar-lock", Input).value.strip() or 0)
+        except ValueError:
+            self.lock = 0
+        try:
+            self.ssaver = int(self.query_one("#bar-ssaver", Input).value.strip() or 0)
+        except ValueError:
+            self.ssaver = 0
+
+    def _cur_section(self) -> str:
+        focused = self.app.focused
+        if focused is not None:
+            fid = getattr(focused, "id", None)
+            if fid in (f"bar-{s}" for s in self.sections):
+                return fid.removeprefix("bar-")
+        return "center"
+
+    def _move_selected(self, delta: int) -> None:
+        sec = self._cur_section()
+        ol = self.query_one(f"#bar-{sec}", OptionList)
+        hl = ol.highlighted
+        if hl is None or not (0 <= hl < len(self.sections[sec])):
+            return
+        j = hl + delta
+        if not (0 <= j < len(self.sections[sec])):
+            return
+        lst = self.sections[sec]
+        lst[hl], lst[j] = lst[j], lst[hl]
+        self._rerender(j, sec)
+
+    def _hop(self, step: int) -> None:
+        order = ["left", "center", "right"]
+        sec = self._cur_section()
+        ol = self.query_one(f"#bar-{sec}", OptionList)
+        hl = ol.highlighted
+        if hl is None or not (0 <= hl < len(self.sections[sec])):
+            return
+        item = self.sections[sec].pop(hl)
+        j_sec = (order.index(sec) + step) % 3
+        self.sections[order[j_sec]].append(item)
+        self._rerender(len(self.sections[order[j_sec]]) - 1, order[j_sec])
+
+    def _rerender(self, keep: Optional[int] = None, section: Optional[str] = None) -> None:
+        for sec in ("left", "center", "right"):
+            ol = self.query_one(f"#bar-{sec}", OptionList)
+            hl = ol.highlighted
+            ol.clear_options()
+            ol.add_options(
+                [
+                    Option(
+                        str(w.get("id", w) if isinstance(w, dict) else w),
+                        id=f"{sec}-{i}",
+                    )
+                    for i, w in enumerate(self.sections[sec])
+                ]
+            )
+            if section == sec and keep is not None and 0 <= keep < ol.option_count:
+                try:
+                    ol.highlighted = keep
+                except Exception:
+                    pass
+            elif hl is not None and ol.option_count > 0:
+                try:
+                    ol.highlighted = min(hl, ol.option_count - 1)
+                except Exception:
+                    pass
+        if section is None and keep is not None:
+            for sec in ("left", "center", "right"):
+                ol = self.query_one(f"#bar-{sec}", OptionList)
+                if ol.option_count > 0:
+                    try:
+                        ol.highlighted = keep if 0 <= keep < ol.option_count else 0
+                    except Exception:
+                        pass
+                    break
+
+
+class KbDataTable(DataTable):
+    BINDINGS = [Binding("enter", "edit", "Edit binding")]
+
+    async def action_edit(self) -> None:
+        if self.cursor_row is not None:
+            self.app.query_one(KeybindingsView).edit_selected()
+
+
+class RebindScreen(ModalScreen[dict]):
+    def __init__(self, key: str, description: str, command: str):
+        super().__init__()
+        self.key = key
+        self.description = description
+        self.command = command
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rebind-dialog"):
+            yield Label("Keybinding override", classes="section-title")
+            yield Label("Key", classes="kind-label")
+            yield Input(id="rb-key", value=self.key, placeholder="e.g. SUPER + TAB")
+            yield Label("Description", classes="kind-label")
+            yield Input(id="rb-desc", value=self.description, placeholder="What it does")
+            yield Label("Command", classes="kind-label")
+            yield Input(id="rb-cmd", value=self.command, placeholder="e.g. omarchy-menu toggle root")
+            yield Horizontal(
+                Button("Save", id="rb-save", variant="primary"),
+                Button("Unbind", id="rb-unbind"),
+                Button("Restore default", id="rb-revert"),
+                Button("Cancel", id="rb-cancel"),
+                classes="buttons-row",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#rb-key", Input).focus()
+
+    @on(Button.Pressed)
+    def _button(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "rb-save":
+            key = self.query_one("#rb-key", Input).value.strip()
+            desc = self.query_one("#rb-desc", Input).value.strip()
+            cmd = self.query_one("#rb-cmd", Input).value.strip()
+            if not key:
+                self.notify("Key is required", severity="warning")
+                return
+            if not cmd:
+                self.notify("Command is required", severity="warning")
+                return
+            self.dismiss({"action": "save", "key": key, "description": desc, "command": cmd})
+        elif ev.button.id == "rb-unbind":
+            self.dismiss({"action": "unbind"})
+        elif ev.button.id == "rb-revert":
+            self.dismiss({"action": "revert"})
+        elif ev.button.id == "rb-cancel":
+            self.dismiss({"action": "cancel"})
+
+
+class TmuxRebindScreen(ModalScreen[dict]):
+    def __init__(
+        self,
+        key: str = "",
+        description: str = "",
+        command: str = "",
+        table: str = "prefix",
+        editing: bool = False,
+    ):
+        super().__init__()
+        self.key = key
+        self.description = description
+        self.command = command
+        self.table = table if table in TMUX_TABLES else "prefix"
+        self.editing = editing
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rebind-dialog"):
+            yield Label(f"Tmux keybinding {'edit' if self.editing else 'add'}", classes="section-title")
+            yield Label("Table", classes="kind-label")
+            yield Select([(t, t) for t in TMUX_TABLES], id="rb-table", value=self.table)
+            yield Label("Key", classes="kind-label")
+            yield Input(id="rb-key", value=self.key, placeholder="e.g. C-M-Left, M-S-Enter, C-Space")
+            yield Label("Description", classes="kind-label")
+            yield Input(id="rb-desc", value=self.description, placeholder="What it does")
+            yield Label("Command", classes="kind-label")
+            yield Input(id="rb-cmd", value=self.command, placeholder="e.g. new-window, split-window -h")
+            yield Horizontal(
+                Button("Save", id="rb-save", variant="primary"),
+                Button("Unbind" if self.editing else "Cancel", id="rb-unbind" if self.editing else "rb-cancel"),
+                classes="buttons-row",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#rb-key", Input).focus()
+
+    @on(Button.Pressed)
+    def _button(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "rb-save":
+            key = self.query_one("#rb-key", Input).value.strip()
+            desc = self.query_one("#rb-desc", Input).value.strip()
+            cmd = self.query_one("#rb-cmd", Input).value.strip()
+            if not key:
+                self.notify("Key is required", severity="warning")
+                return
+            if not cmd:
+                self.notify("Command is required", severity="warning")
+                return
+            if not validate_tmux_key(key):
+                self.notify(f"Invalid tmux key: {key}", severity="warning")
+                return
+            table = str(self.query_one("#rb-table", Select).value or self.table)
+            if table not in TMUX_TABLES:
+                self.notify(f"Invalid tmux table: {table}", severity="warning")
+                return
+            action = "save" if self.editing else "add"
+            self.dismiss(
+                {
+                    "action": action,
+                    "key": key,
+                    "description": desc,
+                    "command": cmd,
+                    "table": table,
+                    "old_key": self.key,
+                }
+            )
+        elif ev.button.id in ("rb-unbind", "rb-cancel"):
+            if ev.button.id == "rb-unbind" and self.editing:
+                self.dismiss({"action": "unbind", "key": self.key})
+            else:
+                self.dismiss({"action": "cancel"})
+
+
+class HerdrRebindScreen(ModalScreen[dict]):
+    def __init__(self, name: str = "", combo: str = "", editing: bool = False):
+        super().__init__()
+        self.name = name
+        self.combo = combo
+        self.editing = editing
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rebind-dialog"):
+            yield Label(f"Herdr keybinding {'edit' if self.editing else 'add'}", classes="section-title")
+            yield Label("Setting name", classes="kind-label")
+            yield Input(id="rb-name", value=self.name, placeholder="e.g. workspace_left, pane_split_h")
+            yield Label("Key combo(s)", classes="kind-label")
+            yield Input(id="rb-combo", value=self.combo, placeholder="e.g. ctrl+alt+left, prefix+q, alt+shift+enter")
+            yield Horizontal(
+                Button("Save", id="rb-save", variant="primary"),
+                Button("Unbind" if self.editing else "Cancel", id="rb-unbind" if self.editing else "rb-cancel"),
+                classes="buttons-row",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#rb-name", Input).focus()
+
+    @on(Button.Pressed)
+    def _button(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "rb-save":
+            name = self.query_one("#rb-name", Input).value.strip()
+            combo = self.query_one("#rb-combo", Input).value.strip()
+            if not name:
+                self.notify("Setting name is required", severity="warning")
+                return
+            if not combo:
+                self.notify("Key combo is required", severity="warning")
+                return
+            combo_list = parse_herdr_combo(combo)
+            if not combo_list:
+                self.notify("At least one valid combo required", severity="warning")
+                return
+            action = "save" if self.editing else "add"
+            self.dismiss({"action": action, "name": name, "combo": combo_list, "old_name": self.name})
+        elif ev.button.id in ("rb-unbind", "rb-cancel"):
+            if ev.button.id == "rb-unbind" and self.editing:
+                self.dismiss({"action": "unbind", "name": self.name})
+            else:
+                self.dismiss({"action": "cancel"})
+
+
+class NvimRebindScreen(ModalScreen[dict]):
+    def __init__(self, mode: str = "n", key: str = "", command: str = "", description: str = "", editing: bool = False):
+        super().__init__()
+        self.mode = mode
+        self.key = key
+        self.command = command
+        self.description = description
+        self.editing = editing
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rebind-dialog"):
+            yield Label(f"Neovim keymap {'edit' if self.editing else 'add'}", classes="section-title")
+            yield Label("Mode", classes="kind-label")
+            yield Select([(m, m) for m in NVIM_MODES], id="rb-mode", value=self.mode)
+            yield Label("Key", classes="kind-label")
+            yield Input(id="rb-key", value=self.key, placeholder="e.g. <leader>f, <C-p>, j")
+            yield Label("Command", classes="kind-label")
+            yield Input(id="rb-cmd", value=self.command, placeholder="e.g. :Telescope find_files<CR>, <cmd>w<CR>")
+            yield Label("Description", classes="kind-label")
+            yield Input(id="rb-desc", value=self.description, placeholder="Optional description")
+            yield Horizontal(
+                Button("Save", id="rb-save", variant="primary"),
+                Button("Unbind" if self.editing else "Cancel", id="rb-unbind" if self.editing else "rb-cancel"),
+                classes="buttons-row",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#rb-key", Input).focus()
+
+    @on(Button.Pressed)
+    def _button(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "rb-save":
+            mode = str(self.query_one("#rb-mode", Select).value)
+            key = self.query_one("#rb-key", Input).value.strip()
+            cmd = self.query_one("#rb-cmd", Input).value.strip()
+            desc = self.query_one("#rb-desc", Input).value.strip()
+            if not mode:
+                self.notify("Mode is required", severity="warning")
+                return
+            if not key:
+                self.notify("Key is required", severity="warning")
+                return
+            if not cmd:
+                self.notify("Command is required", severity="warning")
+                return
+            if not validate_nvim_mode(mode):
+                self.notify(f"Invalid mode: {mode}", severity="warning")
+                return
+            action = "save" if self.editing else "add"
+            self.dismiss({"action": action, "mode": mode, "key": key, "command": cmd, "description": desc, "old_key": self.key})
+        elif ev.button.id in ("rb-unbind", "rb-cancel"):
+            if ev.button.id == "rb-unbind" and self.editing:
+                self.dismiss({"action": "unbind", "mode": self.mode, "key": self.key})
+            else:
+                self.dismiss({"action": "cancel"})
+
+
+class WorkspaceRenameScreen(ModalScreen[dict]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, ws_id: int, current_name: str):
+        super().__init__()
+        self.ws_id = ws_id
+        self.current_name = current_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rebind-dialog"):
+            yield Label(f"Rename Workspace {self.ws_id}", classes="section-title")
+            yield Label("New name", classes="kind-label")
+            yield Input(id="ws-rename-input", value=self.current_name, placeholder="e.g. dev, web, terminal")
+            yield Horizontal(
+                Button("Save", id="ws-rename-save", variant="primary"),
+                Button("Cancel", id="ws-rename-cancel"),
+                classes="buttons-row",
+            )
+
+    def on_mount(self) -> None:
+        inp = self.query_one("#ws-rename-input", Input)
+        inp.focus()
+        inp.cursor_position = len(self.current_name)
+
+    def _commit(self) -> None:
+        new_name = self.query_one("#ws-rename-input", Input).value.strip()
+        if not new_name:
+            self.notify("Name is required", severity="warning")
+            return
+        self.dismiss({"action": "save", "name": new_name})
+
+    def action_cancel(self) -> None:
+        self.dismiss({"action": "cancel"})
+
+    @on(Input.Submitted, "#ws-rename-input")
+    def _submitted(self) -> None:
+        self._commit()
+
+    @on(Button.Pressed)
+    def _button(self, ev: Button.Pressed) -> None:
+        if ev.button.id == "ws-rename-save":
+            self._commit()
+        elif ev.button.id == "ws-rename-cancel":
+            self.action_cancel()
+
+
+class KeybindingsView(Vertical):
+    TABS = (
+        ("hypr", "Hyprland", ("Key Binding", "Description")),
+        ("tmux", "Tmux", ("Table", "Key", "Description", "Command")),
+        ("herdr", "Herdr", ("Setting", "Combo")),
+        ("nvim", "Neovim", ("Mode", "Key", "Command", "Purpose")),
+    )
+    NOTES = {
+        "hypr": "Defaults from `omarchy menu keybindings --print`. User overrides live in ~/.config/hypr/bindings.lua — flagged in rows.",
+        "tmux": "Parsed from ~/.config/tmux/tmux.conf. Table is prefix, root (-n), or copy-mode-vi. Same key can exist in more than one table.",
+        "herdr": "Parsed from ~/.config/herdr/config.toml [keys]. Combos are herdr names (ctrl+alt+left, prefix+q), not tmux C-M-Left.",
+        "nvim": "User overlay at ~/.config/nvim/lua/config/keymaps.lua. LazyVim defaults are not listed; Add writes here.",
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rows: dict[str, list] = {}
+        self.hypr_overrides: set = set()
+        self.hypr_defaults_off = False
+        self.hypr_default_keys: set = set()
+        self.hypr_override_map: dict[str, tuple[str, str]] = {}
+        self._hypr_display: list = []
+        self._display: dict[str, list] = {}
+        self.advanced_mode = False
+
+    def compose(self) -> ComposeResult:
+        with TabbedContent():
+            for tab, label, _cols in self.TABS:
+                with TabPane(label, id=f"pane-{tab}"):
+                    yield Static(self.NOTES[tab], id=f"kb-note-{tab}", classes="hint")
+                    yield Input(id=f"kb-search-{tab}", classes="search", placeholder="Search…")
+                    yield Static("", id=f"kb-info-{tab}", classes="hint")
+                    if tab == "hypr":
+                        yield KbDataTable(id=f"kb-table-{tab}", cursor_type="row")
+                    else:
+                        yield DataTable(id=f"kb-table-{tab}", cursor_type="row")
+        yield Horizontal(
+            Switch(id="kb-advanced", value=self.advanced_mode),
+            Label("Advanced editing (Tmux/Herdr/Neovim)", classes="hint"),
+            classes="pads",
+        )
+        yield Horizontal(
+            Button("Edit…", id="kb-edit", variant="primary"),
+            Button("Unbind", id="kb-unbind"),
+            Button("Add binding", id="kb-add", variant="primary"),
+            Button("Refresh", id="kb-refresh"),
+            classes="buttons-row",
+        )
+
+    def on_mount(self) -> None:
+        self.advanced_mode = advanced_mode_pref()
+        try:
+            self.query_one("#kb-advanced", Switch).value = self.advanced_mode
+        except Exception:
+            pass
+        self.refresh_view()
+        self._update_edit_buttons()
+
+    def _hypr_active(self) -> bool:
+        try:
+            return str(self.query_one(TabbedContent).active) in ("pane-hypr", "hypr")
+        except Exception:
+            return True
+
+    def _active_tab(self) -> str:
+        try:
+            return str(self.query_one(TabbedContent).active).removeprefix("pane-")
+        except Exception:
+            return "hypr"
+
+    def _update_edit_buttons(self) -> None:
+        hypr = self._hypr_active()
+        adv = self.advanced_mode
+        tab = self._active_tab()
+        editable = hypr or (adv and tab in ("tmux", "herdr", "nvim"))
+        try:
+            self.query_one("#kb-edit", Button).disabled = not editable
+            self.query_one("#kb-unbind", Button).disabled = not editable
+            self.query_one("#kb-add", Button).disabled = not adv
+            self.query_one("#kb-add", Button).display = adv
+        except Exception:
+            pass
+
+    @on(TabbedContent.TabActivated)
+    def _tab_activated(self, ev: TabbedContent.TabActivated) -> None:
+        self._update_edit_buttons()
+
+    @on(Switch.Changed, "#kb-advanced")
+    def _toggle_advanced(self, ev: Switch.Changed) -> None:
+        self.advanced_mode = ev.value
+        set_advanced_mode_pref(self.advanced_mode)
+        self._update_edit_buttons()
+        self.notify(f"Advanced editing {'enabled' if self.advanced_mode else 'disabled'}")
+
+    def refresh_view(self) -> None:
+        cols, rows, overrides, defaults_off = build_hypr_rows()
+        self.rows["hypr"] = rows
+        self.rows["tmux"] = build_tmux_rows()
+        self.rows["herdr"] = build_herdr_rows()
+        self.rows["nvim"] = build_nvim_rows()
+        self.hypr_overrides = overrides
+        self.hypr_defaults_off = defaults_off
+        self.hypr_default_keys = {r[0] for r in rows}
+        self.hypr_override_map = hypr_overrides_map()
+        for tab, _label, cols_def in self.TABS:
+            self.render_table(tab, cols_def)
+        if defaults_off:
+            self.notify("Hyprland default bindings are all disabled (bindings.lua flag)", timeout=3)
+
+    @on(Button.Pressed, "#kb-edit")
+    def _edit(self) -> None:
+        self.edit_selected()
+
+    @on(Button.Pressed, "#kb-unbind")
+    async def _unbind(self) -> None:
+        tab = self._active_tab()
+        if tab == "hypr":
+            await self._unbind_hypr()
+        elif tab == "tmux":
+            await self._unbind_tmux()
+        elif tab == "herdr":
+            await self._unbind_herdr()
+        elif tab == "nvim":
+            await self._unbind_nvim()
+
+    @on(Button.Pressed, "#kb-add")
+    async def _add(self) -> None:
+        tab = self._active_tab()
+        if tab == "tmux":
+            await self._add_tmux()
+        elif tab == "herdr":
+            await self._add_herdr()
+        elif tab == "nvim":
+            await self._add_nvim()
+
+    @on(Button.Pressed, "#kb-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @work
+    async def edit_selected(self) -> None:
+        tab = self._active_tab()
+        if tab == "hypr":
+            await self._edit_hypr()
+        elif tab == "tmux":
+            await self._edit_tmux()
+        elif tab == "herdr":
+            await self._edit_herdr()
+        elif tab == "nvim":
+            await self._edit_nvim()
+
+    async def _edit_hypr(self) -> None:
+        key = self._selected_key()
+        if not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        desc, cmd = self.hypr_override_map.get(key, ("", ""))
+        if not desc and self._hypr_display:
+            table = self.query_one("#kb-table-hypr", DataTable)
+            if 0 <= table.cursor_row < len(self._hypr_display):
+                desc = self._hypr_display[table.cursor_row][1].split("  [user override]")[0]
+        result = await self.app.push_screen_wait(RebindScreen(key, desc, cmd))
+        if not result or result["action"] == "cancel":
+            return
+        if result["action"] == "unbind":
+            hypr_write_unbind(key)
+            self.notify(f"Unbound {key}")
+        elif result["action"] == "revert":
+            hypr_write_revert(key)
+            self.notify(f"Restored default for {key}")
+        else:
+            hypr_write_change(key, result["key"], result["description"], result["command"], self.hypr_default_keys)
+            verb = "Changed" if result["key"] == key else "Rebound"
+            self.notify(f"{verb} {result['key']} → {result['command']}")
+        self.refresh_view()
+
+    async def _edit_tmux(self) -> None:
+        table, key, desc, cmd, flags = self._selected_tmux()
+        if not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        result = await self.app.push_screen_wait(
+            TmuxRebindScreen(key, desc, cmd, table=table or "prefix", editing=True)
+        )
+        if not result or result["action"] == "cancel":
+            return
+        if result["action"] == "unbind":
+            tmux_write_unbind(table, key)
+            self.notify(f"Unbound {table}:{key}")
+        else:
+            new_table = result.get("table") or table
+            new_flags = flags if new_table == table else _tmux_flags_for_table(new_table)
+            tmux_write_change(table, key, result["key"], result["description"], result["command"], new_flags)
+            self.notify(f"Updated {new_table}:{result['key']} → {result['command']}")
+        self.refresh_view()
+
+    async def _edit_herdr(self) -> None:
+        name = self._selected_herdr()
+        if not name:
+            self.notify("Select a binding first", severity="warning")
+            return
+        row = next((r for r in self.rows["herdr"] if r[0] == name), None)
+        combo = row[1] if row else ""
+        result = await self.app.push_screen_wait(HerdrRebindScreen(name, combo, editing=True))
+        if not result or result["action"] == "cancel":
+            return
+        if result["action"] == "unbind":
+            herdr_write_unbind(name)
+            self.notify(f"Unbound {name}")
+        else:
+            herdr_write_change(name, result["name"], result["combo"])
+            shown = ", ".join(result["combo"]) if isinstance(result["combo"], list) else result["combo"]
+            self.notify(f"Updated {result['name']} → {shown}")
+        self.refresh_view()
+
+    async def _edit_nvim(self) -> None:
+        mode, key, cmd, desc = self._selected_nvim()
+        if not mode or not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        result = await self.app.push_screen_wait(NvimRebindScreen(mode, key, cmd, desc, editing=True))
+        if not result or result["action"] == "cancel":
+            return
+        if result["action"] == "unbind":
+            nvim_write_unbind(mode, key)
+            self.notify(f"Unbound {mode}:{key}")
+        else:
+            nvim_write_change(mode, key, result["mode"], result["key"], result["command"], result["description"])
+            self.notify(f"Updated {result['mode']}:{result['key']} → {result['command']}")
+        self.refresh_view()
+
+    async def _unbind_hypr(self) -> None:
+        key = self._selected_key()
+        if not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        hypr_write_unbind(key)
+        self.notify(f"Unbound {key}")
+        self.refresh_view()
+
+    async def _unbind_tmux(self) -> None:
+        table, key, _, _, _ = self._selected_tmux()
+        if not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        tmux_write_unbind(table, key)
+        self.notify(f"Unbound {table}:{key}")
+        self.refresh_view()
+
+    async def _unbind_herdr(self) -> None:
+        name = self._selected_herdr()
+        if not name:
+            self.notify("Select a binding first", severity="warning")
+            return
+        herdr_write_unbind(name)
+        self.notify(f"Unbound {name}")
+        self.refresh_view()
+
+    async def _unbind_nvim(self) -> None:
+        mode, key, _, _ = self._selected_nvim()
+        if not mode or not key:
+            self.notify("Select a binding first", severity="warning")
+            return
+        nvim_write_unbind(mode, key)
+        self.notify(f"Unbound {mode}:{key}")
+        self.refresh_view()
+
+    async def _add_tmux(self) -> None:
+        result = await self.app.push_screen_wait(TmuxRebindScreen())
+        if not result or result["action"] == "cancel":
+            return
+        tmux_write_add(result["key"], result["description"], result["command"], result.get("table") or "prefix")
+        self.notify(f"Added {result.get('table', 'prefix')}:{result['key']} → {result['command']}")
+        self.refresh_view()
+
+    async def _add_herdr(self) -> None:
+        result = await self.app.push_screen_wait(HerdrRebindScreen())
+        if not result or result["action"] == "cancel":
+            return
+        herdr_write_add(result["name"], result["combo"])
+        self.notify(f"Added {result['name']} → {result['combo']}")
+        self.refresh_view()
+
+    async def _add_nvim(self) -> None:
+        result = await self.app.push_screen_wait(NvimRebindScreen())
+        if not result or result["action"] == "cancel":
+            return
+        nvim_write_add(result["mode"], result["key"], result["command"], result["description"])
+        self.notify(f"Added {result['mode']}:{result['key']} → {result['command']}")
+        self.refresh_view()
+
+    def _cursor_row(self, tab: str) -> Optional[list]:
+        table = self.query_one(f"#kb-table-{tab}", DataTable)
+        rows = self._display.get(tab) or []
+        if table.cursor_row is None or not (0 <= table.cursor_row < len(rows)):
+            return None
+        return rows[table.cursor_row]
+
+    def _selected_key(self) -> Optional[str]:
+        row = self._cursor_row("hypr")
+        return None if not row else str(row[0])
+
+    def _selected_tmux(self) -> tuple:
+        row = self._cursor_row("tmux")
+        if not row:
+            return (None, None, None, None, None)
+        table, key, desc, cmd = row[0], row[1], row[2], row[3]
+        flags = row[4] if len(row) > 4 else _tmux_flags_for_table(table)
+        return (table, key, desc, cmd, flags)
+
+    def _selected_herdr(self) -> Optional[str]:
+        row = self._cursor_row("herdr")
+        return None if not row else row[0]
+
+    def _selected_nvim(self) -> tuple:
+        row = self._cursor_row("nvim")
+        if not row:
+            return (None, None, None, None)
+        return (row[0], row[1], row[2], row[3])
+
+    @on(Input.Changed)
+    def _search(self, ev: Input.Changed) -> None:
+        if not ev.input.id or not ev.input.id.startswith("kb-search-"):
+            return
+        tab = ev.input.id.removeprefix("kb-search-")
+        cols = next(c for t, _l, c in self.TABS if t == tab)
+        self.render_table(tab, cols)
+
+    def render_table(self, tab: str, columns: tuple) -> None:
+        query = self.query_one(f"#kb-search-{tab}", Input).value.strip().lower()
+        rows = self.rows.get(tab) or []
+        table = self.query_one(f"#kb-table-{tab}", DataTable)
+        table.clear(columns=True)
+        table.add_columns(*columns)
+        filtered = [r for r in rows if not query or any(query in str(c).lower() for c in r)]
+        shown = [r[: len(columns)] for r in filtered]
+        if shown:
+            table.add_rows(shown)
+        self._display[tab] = filtered
+        if tab == "hypr":
+            self._hypr_display = filtered
+        self.query_one(f"#kb-info-{tab}", Static).update(f"{len(filtered)} of {len(rows)} rows")
+
+
+class TerminalsView(Vertical):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.terminals: list[str] = []
+        self.all_terms: list[str] = list(TERMINAL_CONFS)
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Terminals", classes="section-title"),
+                OptionList(id="term-list"),
+                Horizontal(
+                    Button("Set as default", id="term-default", variant="primary"),
+                    Button("Refresh", id="term-refresh"),
+                    classes="buttons-row",
+                ),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Config", classes="section-title"),
+                Static("", id="term-detected", classes="hint"),
+                Static("", id="term-current", classes="hint"),
+                Static("", id="term-path", classes="hint"),
+                Static("", id="term-detail", classes="stat"),
+                classes="col",
+            )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#term-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#term-default")
+    def _set_default(self) -> None:
+        ol = self.query_one("#term-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.all_terms)):
+            self.notify("Select a terminal first", severity="warning")
+            return
+        name = self.all_terms[idx]
+        out, err, code = run(["omarchy", "default", "terminal", name])
+        if code == 0:
+            self.notify(f"Default terminal: {name}")
+        else:
+            self.notify(f"Failed: {err.strip() or out.strip()}", severity="error")
+
+    @on(OptionList.OptionHighlighted, "#term-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        self._detail(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.terminals = [t for t in TERMINAL_CONFS if shutil.which(t)]
+        ol = self.query_one("#term-list", OptionList)
+        ol.clear_options()
+        detected = self.terminals
+        ol.add_options(
+            [
+                Option(("● " if t in detected else "○ ") + t, id=f"term-{slug(t)}")
+                for t in self.all_terms
+            ]
+        )
+        current = default_value("terminal") or "(unset — xdg-terminal-exec)"
+        self.query_one("#term-current", Static).update(f"[b {ACCENT}]Default[/]  {current}")
+
+        installed = ", ".join(detected) or "none detected"
+        self.query_one("#term-detected", Static).update(f"[b]Detected[/]  {installed}")
+        if self.terminals:
+            self._detail(0)
+
+    def _detail(self, idx: int) -> None:
+        if not (0 <= idx < len(self.all_terms)):
+            return
+        name = self.all_terms[idx]
+        self.query_one("#term-path", Static).update(f"[b {STEEL}]Config[/]  {TERMINAL_CONFS[name]}")
+        detail = []
+        path = TERMINAL_CONFS[name]
+        if not path.exists():
+            detail.append(f"[{STEEL}]not present[/]")
+        else:
+            detail.append(f"[{STEEL}]size {path.stat().st_size} bytes[/]")
+            for line in path.read_text().splitlines():
+                s = line.strip()
+                if s.startswith("include") or s.startswith("import") or s.startswith("source"):
+                    detail.append(f"[{ACCENT}]themed via:[/] {s}")
+                elif s and not s.startswith("#"):
+                    first = s[:72]
+                    try:
+                        detail.append(first)
+                    except Exception:
+                        pass
+                    break
+        self.query_one("#term-detail", Static).update("\n".join(detail))
+
+
+class PluginsView(Vertical):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.plugins: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Plugins", classes="section-title"),
+                OptionList(id="plugin-list"),
+                Horizontal(
+                    Button("Toggle enable", id="plugin-toggle"),
+                    Button("Open folder", id="plugin-open"),
+                    Button("Refresh", id="plugin-refresh"),
+                    classes="buttons-row",
+                ),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Details", classes="section-title"),
+                Static("", id="plugin-name", classes="stat"),
+                Static("", id="plugin-meta", classes="hint"),
+                Static("", id="plugin-desc", classes="hint"),
+                classes="col",
+            )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#plugin-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#plugin-open")
+    def _open(self) -> None:
+        idx = self.query_one("#plugin-list", OptionList).highlighted
+        if idx is not None and 0 <= idx < len(self.plugins):
+            run(["xdg-open", str(self.plugins[idx]["dir"])])
+
+    @on(Button.Pressed, "#plugin-toggle")
+    def _toggle(self) -> None:
+        ol = self.query_one("#plugin-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.plugins)):
+            self.notify("Select a plugin first", severity="warning")
+            return
+        pid = self.plugins[idx]["id"]
+        data = shell_data()
+        plist = list(data.get("plugins") or [])
+        enabled = plugin_enabled(pid)
+        if enabled:
+            self.notify(f"No-op: {pid} is a bar widget — remove it in the Bar screen to disable")
+            if pid in plist:
+                plist.remove(pid)
+                data["plugins"] = plist
+                write_json(SHELL_JSON, data, backup=True)
+        else:
+            if pid not in plist:
+                plist.append(pid)
+                data["plugins"] = plist
+                write_json(SHELL_JSON, data, backup=True)
+            self.notify(f"Registered {pid} in shell.json plugins (add its widget in Bar to show it)")
+        self.refresh_view()
+
+    @on(OptionList.OptionHighlighted, "#plugin-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        self._detail(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.plugins = plugin_entries()
+        ol = self.query_one("#plugin-list", OptionList)
+        ol.clear_options()
+        for p in self.plugins:
+            state = "● " if plugin_enabled(p["id"]) else "○ "
+            ol.add_options([Option(state + p["id"], id=f"pl-{slug(p['id'])}")])
+        if self.plugins:
+            self._detail(0)
+
+    def _detail(self, idx: int) -> None:
+        if not (0 <= idx < len(self.plugins)):
+            return
+        p = self.plugins[idx]
+        meta = p["meta"]
+        state = "enabled" if plugin_enabled(p["id"]) else "disabled"
+        self.query_one("#plugin-name", Static).update(
+            f"[b {ACCENT}]{p['id']}[/]  [i]{state}[/]"
+        )
+        lines = []
+        for key in ("name", "version", "author", "kinds", "description"):
+            if meta.get(key):
+                lines.append(f"[b {STEEL}]{key}[/] {meta[key]}")
+        if meta.get("barWidget"):
+            bw = meta["barWidget"]
+            lines.append(f"[b {STEEL}]bar[/] {bw.get('displayName','')} — {bw.get('description','')}")
+        if meta.get("omarchy"):
+            lines.append(f"[b {STEEL}]omarchy[/] {meta['omarchy']}")
+        self.query_one("#plugin-meta", Static).update("\n".join(lines) if lines else "[i]no manifest.json[/]")
+        self.query_one("#plugin-desc", Static).update(f"dir: {p['dir']}")
+
+
+class HooksView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hooks: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Lifecycle hooks (dir/file)", classes="section-title"),
+                OptionList(id="hook-list"),
+                Horizontal(
+                    Button("Toggle on/off", id="hook-toggle", variant="primary"),
+                    Button("Refresh", id="hook-refresh"),
+                    classes="buttons-row",
+                ),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Contents", classes="section-title"),
+                Static("", id="hook-path", classes="hint"),
+                Static("", id="hook-content", classes="stat"),
+                classes="col",
+            )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#hook-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#hook-toggle")
+    def _toggle(self) -> None:
+        ol = self.query_one("#hook-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.hooks)):
+            self.notify("Select a hook first", severity="warning")
+            return
+        h = self.hooks[idx]
+        path = h["path"]
+        if h["active"]:
+            new = path.with_name(path.name + ".sample")
+        else:
+            new = path.with_name(path.name.removesuffix(".sample"))
+        try:
+            path.rename(new)
+            self.notify(f"{'Disabled' if h['active'] else 'Enabled'}: {h['name']}")
+        except Exception as exc:
+            self.notify(f"Failed: {exc}", severity="error")
+        self.refresh_view()
+
+    @on(OptionList.OptionHighlighted, "#hook-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        self._detail(ev.option_index)
+
+    def refresh_view(self) -> None:
+        self.hooks = hook_entries()
+        ol = self.query_one("#hook-list", OptionList)
+        ol.clear_options()
+        for h in self.hooks:
+            state = "● " if h["active"] else "○ "
+            ol.add_options(
+                [Option(state + f"{h['event']}/{h['name']}", id=f"hk-{slug(h['path'].stem)}")]
+            )
+        if self.hooks:
+            self._detail(0)
+
+    def _detail(self, idx: int) -> None:
+        if not (0 <= idx < len(self.hooks)):
+            return
+        h = self.hooks[idx]
+        self.query_one("#hook-path", Static).update(str(h["path"]))
+        content = h["path"].read_text(errors="replace")
+        lines = content.splitlines()
+        preview = "\n".join(lines if len(lines) <= 40 else lines[:40] + ["… (truncated)"])
+        self.query_one("#hook-content", Static).update(preview if preview.strip() else "[i]empty[/]")
+
+
+class DefaultsView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kinds = list(DEFAULTS)
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            f"Values are written via `omarchy default <kind> <value>` into ~/.config/omarchy/defaults.",
+            classes="hint",
+        )
+        for kind in self.kinds:
+            with Horizontal(classes="defaults-row"):
+                yield Label(kind, classes="kind-label")
+                yield Input(id=f"def-{kind}", placeholder=", ".join(DEFAULTS[kind]))
+                yield Button("Apply", id=f"def-apply-{kind}")
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed)
+    def _apply(self, ev: Button.Pressed) -> None:
+        if not ev.button.id or not ev.button.id.startswith("def-apply-"):
+            return
+        kind = ev.button.id.removeprefix("def-apply-")
+        value = self.query_one(f"#def-{kind}", Input).value.strip()
+        candidates = DEFAULTS.get(kind, [])
+        if not value:
+            self.notify("Enter a value first", severity="warning")
+            return
+        if candidates and value not in candidates:
+            self.notify(
+                f"{value} is not a known {kind} ({', '.join(candidates)})",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        out, err, code = run(["omarchy", "default", kind, value])
+        if code == 0:
+            self.notify(f"Default {kind} → {value}")
+        else:
+            self.notify(f"Failed: {err.strip() or out.strip()}", severity="error")
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        for kind in self.kinds:
+            self.query_one(f"#def-{kind}", Input).value = default_value(kind)
+
+
+class WallpapersView(VerticalScroll):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.backgrounds: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        yield Label("Wallpapers — ↑/↓ to select, Enter to set, N for next", classes="section-title")
+        with Horizontal(classes="pads"):
+            yield Vertical(
+                Label("Available Backgrounds", classes="section-title"),
+                OptionList(id="wallpaper-list"),
+                classes="col",
+            )
+            yield Vertical(
+                Label("Preview", classes="section-title"),
+                Static("", id="wp-preview", classes="stat"),
+                Static("", id="wp-current", classes="hint"),
+                classes="col",
+            )
+        yield Horizontal(
+            Button("Set as background", id="wp-set", variant="primary"),
+            Button("Preview image", id="wp-preview-img"),
+            Button("Next background", id="wp-next"),
+            Button("Refresh", id="wp-refresh"),
+            classes="buttons-row",
+        )
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#wp-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#wp-next")
+    def _next(self) -> None:
+        out, err, code = next_wallpaper()
+        if code == 0:
+            self.notify("Switched to next background")
+        else:
+            self.notify(f"Failed: {err.strip() or out.strip()}", severity="error")
+        self.refresh_view()
+
+    @on(Button.Pressed, "#wp-set")
+    def _set(self) -> None:
+        ol = self.query_one("#wallpaper-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.backgrounds)):
+            self.notify("Select a background first", severity="warning")
+            return
+        path = str(self.backgrounds[idx]["path"])
+        out, err, code = set_wallpaper(path)
+        if code == 0:
+            self.notify(f"Background set: {self.backgrounds[idx]['name']}")
+        else:
+            self.notify(f"Failed: {err.strip() or out.strip()}", severity="error")
+        self.refresh_view()
+
+    @on(Button.Pressed, "#wp-preview-img")
+    def _preview_image(self) -> None:
+        ol = self.query_one("#wallpaper-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.backgrounds)):
+            self.notify("Select a background first", severity="warning")
+            return
+        path = str(self.backgrounds[idx]["path"])
+        run(["xdg-open", path])
+        self.notify(f"Opening {self.backgrounds[idx]['name']} in image viewer")
+
+    @on(OptionList.OptionHighlighted, "#wallpaper-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        if 0 <= ev.option_index < len(self.backgrounds):
+            bg = self.backgrounds[ev.option_index]
+            self.query_one("#wp-current", Static).update(
+                f"[b {ACCENT}]Current[/]  {bg['name']}" if bg["current"] else f"[b {STEEL}]Selected[/]  {bg['name']}"
+            )
+            self._show_preview(bg)
+
+    def _show_preview(self, bg: dict) -> None:
+        path = bg["path"]
+        try:
+            stat = path.stat()
+            size_mb = stat.st_size / (1024 * 1024)
+            ext = path.suffix.upper()
+            preview_text = (
+                f"[b {ACCENT}]{bg['name']}[/]\n\n"
+                f"[b]Path:[/] {path}\n"
+                f"[b]Size:[/] {size_mb:.1f} MB\n"
+                f"[b]Type:[/] {ext}\n"
+                f"\n[b {STEEL}]Press 'Preview image' to open in image viewer[/]"
+            )
+            if bg["current"]:
+                preview_text += f"\n[b {ACCENT}]● Currently active[/]"
+        except Exception:
+            preview_text = f"[b {ACCENT}]{bg['name']}[/]\n\nError reading file info"
+        self.query_one("#wp-preview", Static).update(preview_text)
+
+    def refresh_view(self) -> None:
+        self.backgrounds = get_wallpaper_backgrounds()
+        ol = self.query_one("#wallpaper-list", OptionList)
+        ol.clear_options()
+        for bg in self.backgrounds:
+            marker = "● " if bg["current"] else "○ "
+            ol.add_options([Option(marker + bg["name"], id=f"wp-{slug(bg['name'])}")])
+        if self.backgrounds:
+            self._highlight(type("Ev", (), {"option_index": 0})())
+
+
+class InputView(VerticalScroll):
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "Mouse, keyboard, and touchpad. Writes ~/.config/hypr/input.lua then hyprctl reload.",
+            classes="hint",
+        )
+        yield Label("Mouse", classes="section-title")
+        with Horizontal(classes="settings-row"):
+            yield Label("Sensitivity (-1..1)", classes="kind-label")
+            yield Input(id="in-sens", placeholder="0.0")
+        with Horizontal(classes="settings-row"):
+            yield Label("Acceleration", classes="kind-label")
+            yield Select([("adaptive", "adaptive"), ("flat", "flat")], id="in-accel", value="adaptive")
+        with Horizontal(classes="settings-row"):
+            yield Label("Follow mouse", classes="kind-label")
+            yield Select(
+                [("0 off", "0"), ("1 loose", "1"), ("2 full", "2"), ("3 no-steal", "3")],
+                id="in-follow",
+                value="1",
+            )
+        yield Label("Keyboard", classes="section-title")
+        with Horizontal(classes="settings-row"):
+            yield Label("Layout", classes="kind-label")
+            yield Input(id="in-layout", placeholder="us  or  us,ru")
+        with Horizontal(classes="settings-row"):
+            yield Label("Variant", classes="kind-label")
+            yield Input(id="in-variant", placeholder="optional, e.g. intl")
+        with Horizontal(classes="settings-row"):
+            yield Label("Options", classes="kind-label")
+            yield Input(id="in-options", placeholder="compose:caps,shift:both_capslock_cancel")
+        with Horizontal(classes="settings-row"):
+            yield Label("Repeat rate", classes="kind-label")
+            yield Input(id="in-rate", placeholder="40")
+        with Horizontal(classes="settings-row"):
+            yield Label("Repeat delay ms", classes="kind-label")
+            yield Input(id="in-delay", placeholder="250")
+        with Horizontal(classes="settings-row"):
+            yield Label("Numlock on start", classes="kind-label")
+            yield Switch(id="in-numlock")
+        yield Label("Touchpad", classes="section-title")
+        with Horizontal(classes="settings-row"):
+            yield Label("Natural scroll", classes="kind-label")
+            yield Switch(id="in-natural")
+        with Horizontal(classes="settings-row"):
+            yield Label("Two-finger click", classes="kind-label")
+            yield Switch(id="in-clickfinger")
+        with Horizontal(classes="settings-row"):
+            yield Label("Disable while typing", classes="kind-label")
+            yield Switch(id="in-dwt")
+        with Horizontal(classes="settings-row"):
+            yield Label("Scroll factor", classes="kind-label")
+            yield Input(id="in-scroll", placeholder="0.4")
+        yield Horizontal(
+            Button("Save & apply", id="in-save", variant="primary"),
+            Button("Reload live", id="in-reload"),
+            classes="buttons-row",
+        )
+        yield Static("", id="in-status", classes="hint")
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        s = read_input_settings()
+        self.query_one("#in-sens", Input).value = str(s["sensitivity"])
+        try:
+            self.query_one("#in-accel", Select).value = s["accel_profile"] if s["accel_profile"] in ("adaptive", "flat") else "adaptive"
+        except Exception:
+            pass
+        try:
+            self.query_one("#in-follow", Select).value = str(int(s["follow_mouse"]))
+        except Exception:
+            pass
+        self.query_one("#in-layout", Input).value = str(s["kb_layout"])
+        self.query_one("#in-variant", Input).value = str(s["kb_variant"])
+        self.query_one("#in-options", Input).value = str(s["kb_options"])
+        self.query_one("#in-rate", Input).value = str(s["repeat_rate"])
+        self.query_one("#in-delay", Input).value = str(s["repeat_delay"])
+        self.query_one("#in-numlock", Switch).value = bool(s["numlock_by_default"])
+        self.query_one("#in-natural", Switch).value = bool(s["natural_scroll"])
+        self.query_one("#in-clickfinger", Switch).value = bool(s["clickfinger_behavior"])
+        self.query_one("#in-dwt", Switch).value = bool(s["disable_while_typing"])
+        self.query_one("#in-scroll", Input).value = str(s["scroll_factor"])
+        self.query_one("#in-status", Static).update("Live Hyprland values. Save writes input.lua.")
+
+    def _collect(self) -> dict | None:
+        def num(widget_id: str, kind):
+            raw = self.query_one(widget_id, Input).value.strip()
+            return kind(raw)
+
+        try:
+            sensitivity = num("#in-sens", float)
+            repeat_rate = num("#in-rate", int)
+            repeat_delay = num("#in-delay", int)
+            scroll_factor = num("#in-scroll", float)
+        except ValueError:
+            self.notify("Sensitivity, rates, and scroll factor must be numbers", severity="warning")
+            return None
+        if not -1 <= sensitivity <= 1:
+            self.notify("Sensitivity must be between -1 and 1", severity="warning")
+            return None
+        layout = self.query_one("#in-layout", Input).value.strip() or "us"
+        accel = str(self.query_one("#in-accel", Select).value or "adaptive")
+        follow = str(self.query_one("#in-follow", Select).value or "1")
+        return {
+            "sensitivity": sensitivity,
+            "accel_profile": accel if accel in ("adaptive", "flat") else "adaptive",
+            "follow_mouse": int(follow),
+            "kb_layout": layout,
+            "kb_variant": self.query_one("#in-variant", Input).value.strip(),
+            "kb_options": self.query_one("#in-options", Input).value.strip(),
+            "repeat_rate": repeat_rate,
+            "repeat_delay": repeat_delay,
+            "numlock_by_default": self.query_one("#in-numlock", Switch).value,
+            "natural_scroll": self.query_one("#in-natural", Switch).value,
+            "clickfinger_behavior": self.query_one("#in-clickfinger", Switch).value,
+            "disable_while_typing": self.query_one("#in-dwt", Switch).value,
+            "scroll_factor": scroll_factor,
+        }
+
+    @on(Button.Pressed, "#in-reload")
+    def _reload(self) -> None:
+        self.refresh_view()
+        self.notify("Reloaded live input values")
+
+    @on(Button.Pressed, "#in-save")
+    def _save(self) -> None:
+        settings = self._collect()
+        if not settings:
+            return
+        ok, msg = write_input_settings(settings)
+        if ok:
+            self.notify("Input settings applied")
+            self.query_one("#in-status", Static).update("Saved ~/.config/hypr/input.lua and reloaded Hyprland.")
+        else:
+            self.notify(msg, severity="error")
+            self.query_one("#in-status", Static).update(msg)
+
+
+class WorkspacesView(VerticalScroll):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.workspaces: list[dict] = []
+        self.saved_names: dict[int, str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Label("Workspaces 1–10 — Enter to rename. Empty slots stay listed.", classes="section-title")
+        yield OptionList(id="workspace-list")
+        yield Horizontal(
+            Button("Rename", id="ws-rename", variant="primary"),
+            Button("Save names", id="ws-save"),
+            Button("Clone plugin", id="ws-clone-plugin"),
+            Button("Refresh", id="ws-refresh"),
+            classes="buttons-row",
+        )
+        yield Static("", id="ws-info", classes="hint")
+        yield Static("", id="ws-persist-status", classes="hint")
+
+    def on_mount(self) -> None:
+        self.refresh_view()
+
+    @on(OptionList.OptionSelected, "#workspace-list")
+    def _list_selected(self) -> None:
+        self.action_rename()
+
+    def action_rename(self) -> None:
+        ol = self.query_one("#workspace-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self.workspaces)):
+            self.notify("Select a workspace first", severity="warning")
+            return
+        ws = self.workspaces[idx]
+        ws_id = ws["id"]
+        self._rename_ws_id = ws_id
+        current_name = self.saved_names.get(ws_id, ws.get("name", str(ws_id)))
+        self.app.push_screen(WorkspaceRenameScreen(ws_id, current_name), self._on_rename_result)
+
+    def _on_rename_result(self, result: dict | None) -> None:
+        if not result or result.get("action") != "save":
+            return
+        ws_id = getattr(self, "_rename_ws_id", None)
+        if ws_id is None:
+            return
+        new_name = result["name"].strip()
+        if not new_name:
+            self.notify("Name is required", severity="warning")
+            return
+        self.saved_names[ws_id] = new_name
+        if save_workspace_labels_to_plugin(self.saved_names):
+            self.notify(f"Workspace {ws_id} is now {new_name}")
+            self.refresh_view()
+        else:
+            self.notify("Could not write workspace names", severity="error")
+
+    @on(Button.Pressed, "#ws-refresh")
+    def _refresh(self) -> None:
+        self.refresh_view()
+
+    @on(Button.Pressed, "#ws-rename")
+    def _rename(self) -> None:
+        self.action_rename()
+
+    @on(Button.Pressed, "#ws-save")
+    def _save(self) -> None:
+        if not self.saved_names:
+            self.notify("No names to save", severity="warning")
+            return
+        ok, msg = ensure_named_workspaces_on_bar()
+        if not ok:
+            self.notify(msg, severity="error")
+            return
+        if save_workspace_labels_to_plugin(self.saved_names):
+            self.notify(f"Workspace names saved on {msg}")
+            self.refresh_view()
+        else:
+            self.notify("Could not write names into the workspaces plugin", severity="error")
+
+    @on(Button.Pressed, "#ws-clone-plugin")
+    def _clone_plugin(self) -> None:
+        ok, msg = ensure_named_workspaces_on_bar()
+        if ok:
+            self.notify(f"Bar is using {msg} for workspace names")
+            self.refresh_view()
+        else:
+            self.notify(msg, severity="error")
+
+    @on(OptionList.OptionHighlighted, "#workspace-list")
+    def _highlight(self, ev: OptionList.OptionHighlighted) -> None:
+        if 0 <= ev.option_index < len(self.workspaces):
+            ws = self.workspaces[ev.option_index]
+            ws_id = ws["id"]
+            current_name = self.saved_names.get(ws_id, ws.get("name", str(ws_id)))
+            monitor = ws.get("monitor") or "inactive"
+            windows = ws.get("windows", 0)
+            self.query_one("#ws-info", Static).update(
+                f"Workspace {ws_id} on {monitor} — {windows} windows"
+            )
+
+    def refresh_view(self) -> None:
+        live = {int(ws["id"]): ws for ws in get_hypr_workspaces() if ws.get("id")}
+        self.saved_names = load_workspace_labels_from_plugin()
+        self.workspaces = []
+        ol = self.query_one("#workspace-list", OptionList)
+        ol.clear_options()
+        for ws_id in range(1, WORKSPACE_SLOT_COUNT + 1):
+            ws = live.get(ws_id, {"id": ws_id, "name": str(ws_id), "monitor": "", "windows": 0})
+            self.workspaces.append(ws)
+            name = self.saved_names.get(ws_id, str(ws_id))
+            marker = "" if ws_id in live else "  (inactive)"
+            ol.add_options([Option(f"{ws_id}: {name}{marker}", id=f"ws-{ws_id}")])
+        if self.workspaces:
+            self._highlight(type("Ev", (), {"option_index": 0})())
+        plugin_dir = get_cloned_workspaces_plugin_dir()
+        if plugin_dir:
+            status = f"Names are {WORKSPACE_NAMES_JSON} (watched by {plugin_dir.name}). All 10 slots are editable."
+        else:
+            status = "Clone omarchy.workspaces first — stock bar chips are numbers, not names."
+        self.query_one("#ws-persist-status", Static).update(f"[b {ACCENT}]{status}[/]")
+
+
+class OmarchyCommandCenter(App):
+    TITLE = "Omarchy Command Center"
+    BINDINGS = [
+        Binding("f1", "goto_dashboard", "Dashboard", show=True),
+        Binding("f2", "goto_themes", "Themes", show=True),
+        Binding("f3", "goto_bar", "Bar", show=True),
+        Binding("f4", "goto_input", "Input", show=True),
+        Binding("f5", "goto_keybindings", "Keybindings", show=True),
+        Binding("f6", "goto_terminals", "Terminals", show=True),
+        Binding("f7", "goto_plugins", "Plugins", show=True),
+        Binding("f8", "goto_hooks", "Hooks", show=True),
+        Binding("f9", "goto_defaults", "Defaults", show=True),
+        Binding("f10", "goto_workspaces", "Workspaces", show=True),
+        Binding("f11", "goto_wallpapers", "Wallpapers", show=True),
+        Binding("1", "goto_dashboard", "Dashboard", show=False),
+        Binding("2", "goto_themes", "Themes", show=False),
+        Binding("3", "goto_bar", "Bar", show=False),
+        Binding("4", "goto_input", "Input", show=False),
+        Binding("5", "goto_keybindings", "Keybindings", show=False),
+        Binding("6", "goto_terminals", "Terminals", show=False),
+        Binding("7", "goto_plugins", "Plugins", show=False),
+        Binding("8", "goto_hooks", "Hooks", show=False),
+        Binding("9", "goto_defaults", "Defaults", show=False),
+        Binding("0", "goto_workspaces", "Workspaces", show=False),
+        Binding("r", "refresh_current", "Refresh", show=True),
+        Binding("q", "quit", "Quit", show=True, priority=True),
+    ]
+    VIEWS = [
+        ("dashboard", "Dashboard"),
+        ("themes", "Themes"),
+        ("bar", "Bar"),
+        ("input", "Input"),
+        ("keybindings", "Keybindings"),
+        ("terminals", "Terminals"),
+        ("plugins", "Plugins"),
+        ("hooks", "Hooks"),
+        ("defaults", "Defaults"),
+        ("wallpapers", "Wallpapers"),
+        ("workspaces", "Workspaces"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self._version = sh(["omarchy", "version"]) or "?"
+        self._apply_theme_css()
+
+    def _apply_theme_css(self) -> None:
+        global PALETTE, ACCENT, STEEL, FG
+        PALETTE = build_palette()
+        ACCENT = PALETTE["accent"]
+        STEEL = PALETTE["dark_foreground"]
+        FG = PALETTE["light_foreground"]
+        self.stylesheet.add_source(app_css(PALETTE), read_from=("", "occ-css"))
+        if self._is_mounted:
+            self.refresh_css()
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="brand"):
+            yield Static(f"OMARCHY  COMMAND CENTER", id="brand-title")
+            yield Static(f"v{self._version}", id="brand-meta")
+        with Horizontal(id="body"):
+            yield OptionList(
+                *[
+                    Option(f"{i + 1}: {label}", id=vid)
+                    for (vid, label), i in zip(self.VIEWS, range(len(self.VIEWS)))
+                ],
+                id="sidebar",
+            )
+            with ContentSwitcher(id="view-switcher"):
+                yield DashboardView(id="dashboard")
+                yield ThemesView(id="themes")
+                yield BarView(id="bar")
+                yield InputView(id="input")
+                yield KeybindingsView(id="keybindings")
+                yield TerminalsView(id="terminals")
+                yield PluginsView(id="plugins")
+                yield HooksView(id="hooks")
+                yield DefaultsView(id="defaults")
+                yield WallpapersView(id="wallpapers")
+                yield WorkspacesView(id="workspaces")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#view-switcher", ContentSwitcher).current = "dashboard"
+        try:
+            self.query_one("#sidebar", OptionList).highlighted = 0
+        except Exception:
+            pass
+
+    @on(OptionList.OptionSelected, "#sidebar")
+    def _nav(self, ev: OptionList.OptionSelected) -> None:
+        self._show(str(ev.option_id))
+
+    def _show(self, view_id: str) -> None:
+        switcher = self.query_one("#view-switcher", ContentSwitcher)
+        if view_id not in {c.id for c in switcher.children}:
+            return
+        switcher.current = view_id
+        widget = self.query_one(f"#{view_id}")
+        if hasattr(widget, "refresh_view"):
+            widget.refresh_view()
+        try:
+            ol = self.query_one("#sidebar", OptionList)
+            for i, (vid, _label) in enumerate(self.VIEWS):
+                if vid == view_id:
+                    ol.highlighted = i
+                    break
+        except Exception:
+            pass
+
+    def action_goto_dashboard(self) -> None:
+        self._show("dashboard")
+
+    def action_goto_themes(self) -> None:
+        self._show("themes")
+
+    def action_goto_bar(self) -> None:
+        self._show("bar")
+
+    def action_goto_input(self) -> None:
+        self._show("input")
+
+    def action_goto_keybindings(self) -> None:
+        self._show("keybindings")
+
+    def action_goto_terminals(self) -> None:
+        self._show("terminals")
+
+    def action_goto_plugins(self) -> None:
+        self._show("plugins")
+
+    def action_goto_hooks(self) -> None:
+        self._show("hooks")
+
+    def action_goto_defaults(self) -> None:
+        self._show("defaults")
+
+    def action_goto_wallpapers(self) -> None:
+        self._show("wallpapers")
+
+    def action_goto_workspaces(self) -> None:
+        self._show("workspaces")
+
+    def action_refresh_current(self) -> None:
+        current = self.query_one("#view-switcher", ContentSwitcher).current
+        widget = self.query_one(f"#{current}")
+        if hasattr(widget, "refresh_view"):
+            widget.refresh_view()
+
+
+if __name__ == "__main__":
+    OmarchyCommandCenter().run()

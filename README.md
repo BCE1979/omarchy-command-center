@@ -23,12 +23,16 @@ required.
   add custom widget ids, change position and transparency, set the clock
   anchor and idle/screensaver timers. Saved to `shell.json` with a
   timestamped backup before each write.
+- **Input** — mouse sensitivity/accel, keyboard layout and repeat,
+  touchpad scroll. Writes `~/.config/hypr/input.lua` and runs
+  `hyprctl reload`.
+- **Workspaces** — rename all 10 bar slots (including empty ones).
+  Names persist on a cloned `$USER.workspaces` widget; save restarts
+  the Omarchy shell so the bar actually recompiles (Quickshell does
+  not clear its QML cache on plugin reload).
 - **Keybindings** — four tabs (Hyprland, Tmux, Herdr, Neovim) with live
-  search. Hyprland rows are parsed from `omarchy menu keybindings
-  --print` and your `bindings.lua` overrides are flagged inline. Edit,
-  unbind, or restore a selected Hyprland binding via override lines
-  written to `~/.config/hypr/bindings.lua` (timestamped backup before
-  each write).
+  search. Advanced editing covers Tmux/Herdr/Neovim against live Omarchy
+  formats. Hyprland overrides go to `~/.config/hypr/bindings.lua`.
 - **Terminals** — detect installed terminal emulators, inspect each
   config (with its theme `include`/`import` line), set the default.
 - **Plugins** — list installed plugins with their manifest metadata and
@@ -55,15 +59,15 @@ cd omarchy-command-center
 # 1. install the only dependency
 pip install --user textual          # or via your distro/venv
 
-# 2. install the app
-./install.sh                         # → copies to ~/.local/bin
+# 2. install the app (v2 is the default)
+./install.sh                         # same as ./install.sh v2
+./install.sh v1                      # original 1.x script
 ```
 
-Or skip the installer and just put the script on your `PATH` yourself —
-it is completely self-contained:
+Or skip the installer and copy a script onto your `PATH`:
 
 ```sh
-cp omarchy-command-center ~/.local/bin/
+cp omarchy-command-center-v2 ~/.local/bin/omarchy-command-center
 chmod +x ~/.local/bin/omarchy-command-center
 ```
 
