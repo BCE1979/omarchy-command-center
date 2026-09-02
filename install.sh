@@ -1,10 +1,53 @@
 #!/usr/bin/env bash
-# Install Omarchy Command Center to ~/.local/bin.
+# Install Omarchy Command Center to ~/.local/bin as `omarchy-command-center`.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
 TARGET="$BIN/omarchy-command-center"
+VERSION="${1:-v2}"
+
+usage() {
+    echo "usage: $0 [v1|v2]" >&2
+    echo "  v2  (default)  install omarchy-command-center-v2 as omarchy-command-center" >&2
+    echo "  v1             install the original omarchy-command-center" >&2
+}
+
+available_versions() {
+    local names=()
+    [[ -f "$REPO_DIR/omarchy-command-center" ]] && names+=(v1)
+    [[ -f "$REPO_DIR/omarchy-command-center-v2" ]] && names+=(v2)
+    if ((${#names[@]})); then
+        printf '%s' "${names[*]}"
+    else
+        printf '%s' "(none)"
+    fi
+}
+
+case "$VERSION" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    v1|1|original)
+        SOURCE="$REPO_DIR/omarchy-command-center"
+        ;;
+    v2|2)
+        SOURCE="$REPO_DIR/omarchy-command-center-v2"
+        ;;
+    *)
+        echo "✗ Unknown version '$VERSION'. Available: $(available_versions)" >&2
+        usage
+        exit 1
+        ;;
+esac
+
+if [[ ! -f "$SOURCE" ]]; then
+    echo "✗ Version '$VERSION' not found at $SOURCE" >&2
+    echo "  Available: $(available_versions)" >&2
+    usage
+    exit 1
+fi
 
 echo "→ checking requirements"
 
@@ -24,7 +67,8 @@ if ! python3 -c 'import textual' >/dev/null 2>&1; then
 fi
 
 mkdir -p "$BIN"
-install -m 0755 "$REPO_DIR/omarchy-command-center" "$TARGET"
+install -m 0755 "$SOURCE" "$TARGET"
 
-echo "✓ installed to $TARGET"
+echo "✓ installed $SOURCE"
+echo "  as $TARGET (version: $VERSION)"
 echo "  run: omarchy-command-center"
