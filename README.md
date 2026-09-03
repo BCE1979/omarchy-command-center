@@ -10,6 +10,8 @@ required.
 
 ## Features
 
+- **Easy / Normal / Advanced** — pick a mode at the top of the sidebar.
+  Easy uses picture labels (🏠 🎨 🧩 …) and hides the fiddly controls.
 - **Dashboard** — at-a-glance view of your Omarchy installation: version,
   active theme, bar position/transparency, idle timers, defaults,
   installed/enabled plugins, hooks, and a commands health check.
@@ -59,15 +61,16 @@ cd omarchy-command-center
 # 1. install the only dependency
 pip install --user textual          # or via your distro/venv
 
-# 2. install the app (v2 is the default)
-./install.sh                         # same as ./install.sh v2
-./install.sh v1                      # original 1.x script
+# 2. install the app (v3 is the default)
+./install.sh                         # same as ./install.sh v3
+./install.sh v2                      # 2.x
+./install.sh v1                      # original 1.x
 ```
 
 Or skip the installer and copy a script onto your `PATH`:
 
 ```sh
-cp omarchy-command-center-v2 ~/.local/bin/omarchy-command-center
+cp omarchy-command-center-v3 ~/.local/bin/omarchy-command-center
 chmod +x ~/.local/bin/omarchy-command-center
 ```
 
@@ -81,7 +84,7 @@ omarchy-command-center
 
 | Key | Action |
 |-----|--------|
-| `1`–`8` | Jump to a view (no F-keys needed) |
+| `1`–`9`, `0` | Jump to a view (no F-keys needed) |
 | `↑`/`↓` | Move in a list |
 | `Enter` | Select / apply |
 | `r` | Refresh the current view |
@@ -94,11 +97,14 @@ omarchy-command-center
 | 1 | Dashboard | status overview, plugin/hook counts |
 | 2 | Themes | browse + apply themes |
 | 3 | Bar | layout, position, idle timers |
-| 4 | Keybindings | Hyprland / Tmux / Herdr / Neovim; Enter or Edit… on a Hyprland row |
-| 5 | Terminals | detection, configs, default |
-| 6 | Plugins | enable/disable, register |
-| 7 | Hooks | lifecycle hooks on/off |
-| 8 | Defaults | agent / browser / editor / terminal |
+| 4 | Input | mouse, keyboard, touchpad |
+| 5 | Keybindings | Hyprland / Tmux / Herdr / Neovim; Enter or Edit… on a Hyprland row |
+| 6 | Terminals | detection, configs, default |
+| 7 | Plugins | enable/disable, register |
+| 8 | Hooks | lifecycle hooks on/off |
+| 9 | Defaults | agent / browser / editor / terminal |
+| F11 | Wallpapers | set the current background |
+| 0 | Workspaces | rename bar workspace slots |
 
 ## Safety
 

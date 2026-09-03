@@ -5,11 +5,12 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
 TARGET="$BIN/omarchy-command-center"
-VERSION="${1:-v2}"
+VERSION="${1:-v3}"
 
 usage() {
-    echo "usage: $0 [v1|v2]" >&2
-    echo "  v2  (default)  install omarchy-command-center-v2 as omarchy-command-center" >&2
+    echo "usage: $0 [v1|v2|v3]" >&2
+    echo "  v3  (default)  install omarchy-command-center-v3 as omarchy-command-center" >&2
+    echo "  v2             install omarchy-command-center-v2" >&2
     echo "  v1             install the original omarchy-command-center" >&2
 }
 
@@ -17,6 +18,7 @@ available_versions() {
     local names=()
     [[ -f "$REPO_DIR/omarchy-command-center" ]] && names+=(v1)
     [[ -f "$REPO_DIR/omarchy-command-center-v2" ]] && names+=(v2)
+    [[ -f "$REPO_DIR/omarchy-command-center-v3" ]] && names+=(v3)
     if ((${#names[@]})); then
         printf '%s' "${names[*]}"
     else
@@ -34,6 +36,9 @@ case "$VERSION" in
         ;;
     v2|2)
         SOURCE="$REPO_DIR/omarchy-command-center-v2"
+        ;;
+    v3|3)
+        SOURCE="$REPO_DIR/omarchy-command-center-v3"
         ;;
     *)
         echo "✗ Unknown version '$VERSION'. Available: $(available_versions)" >&2
